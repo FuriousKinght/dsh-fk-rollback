@@ -818,7 +818,7 @@ const COMMANDS = {
 function main() {
   const opts = parseArgs(process.argv.slice(2))
   if (opts.help || opts.h) { showHelp(); process.exit(C.EXIT.OK) }
-  if (opts.version || opts.v) { console.log('dsh-rollback v1.3.0'); process.exit(C.EXIT.OK) }
+  if (opts.version || opts.v) { console.log('dsh-rollback v1.4.0'); process.exit(C.EXIT.OK) }
 
   const cmd = opts._[0]
   const fn = COMMANDS[cmd]

@@ -271,6 +271,67 @@ dsh-data/plugin-src/dsh-fk-rollback/
 
 ## 更新记录
 
+### v1.4.0（2026-10-21）
+
+**体检新增：client.js 的模块 loader id 一致性检查**
+
+对应 2026-10-21 的真实事故（OFM 插件改名不彻底）：
+
+- `package.json` 的 `name` 改成了 `dsh-fk-our-free-model`
+- 但 `client.js:22` 的 `__ModuleLoader__.load({ id: 'dsh-our-free-model' })` 漏改
+- DSH 判定为「两个模块注册同一个 factory」
+- 抛 `client-modules: duplicate factory registration`
+- `dsh-client-modules` 启动失败 → **全量启动中止，DSH 完全起不来**
+
+这类错误的特征是「静态看不出、启动才知道崩」，所以体检必须提前拦。
+
+新增两个检查码：
+
+| 码 | 级别 | 说明 |
+|---|---|---|
+| `client-loader-id-mismatch` | **fatal** | `client.js` 的 `id` 与包名不一致 —— DSH 会启动失败 |
+| `client-exports-name-mismatch` | warn | `client.js` 的 `exports.name` 与包名风格不一致 |
+
+**修复：`cordis.patch.yml` 为 `[]` 时误报 YAML 语法错误**
+
+全新 profile 的 patch 可能就是一个空数组 `[]`（或只有注释）。
+之前会被判成 `bad-yaml`，让用户以为配置坏了。已修复。
+
+**UI：快照列表所有分组都能折叠**
+
+原来只有「更早」和「回滚记录」能折叠，今天/昨天是固定展开的。
+现在四组都可以点标题折叠/展开，箭头 `▾` / `▸` 指示状态，
+折叠时右侧显示「已折叠」。
+
+---
+
+**修复：分组显示「N 项」但列表为空**
+
+用户反馈：「昨天显示有两项，但是不显示」
+
+根因是 v1.4.0 加折叠时暴露的旧设计缺陷 —— **跨组翻页和分组互相冲突**：
+
+```js
+const primary = [...buckets.today, ...buckets.yesterday]   // 15 项
+const pageItems = primary.slice(0, 10)                      // 第1页只取 10 项
+```
+
+今天有 13 项，第 1 页的 10 条全是今天的 → 「昨天」筛出 0 条，
+但分组头的数字用的是**全量** `g.items.length` = 2。
+于是头显示「昨天 2 项」，下面一条都没有。
+
+翻到第 2 页时反过来：「今天」只剩 3 项，看起来像今天只有 3 个快照。
+
+**修复方式：去掉跨组翻页，每组独立「显示更多」**
+
+分组本身就是天然的分页（今天 / 昨天 / 更早），不需要再跨组翻。
+
+- 每组默认显示 10 条，超出时给「显示更多（还有 N 项）」
+- 点一次加 10 条，只影响本组
+- 切换搜索词 / 筛选条件时，所有组的显示条数重置
+
+---
+
 ### v1.3.0（2026-10-20）
 
 **重启能力已内置 —— 不再需要额外安装任何插件**
@@ -388,4 +449,4 @@ dsh-data/plugin-src/dsh-fk-rollback/
 
 ---
 
-*版本 1.3.0 · 2026-10-20*
+*版本 1.4.0 · 2026-10-21*
