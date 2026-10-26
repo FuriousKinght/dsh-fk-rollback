@@ -12,6 +12,9 @@
  *   · turn/end 钩子内异常绝不能影响对话
  *
  * @module dsh-fk-rollback
+  *
+ * @version 1.5.1
+ * @module 宿主接线（模块一~六的 Http 端点与钩子）
  */
 
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
@@ -673,8 +676,26 @@ function registerRoutes(ctx, ctxInfo) {
         dshVersion: DSH_VERSION,
         health: { overall: report.overall, counts: report.counts, issues: report.issues.slice(0, 20) },
       })
+
+      // 状态部分已由 C.createSnapshot 内部自动纳入（2026-10-22 用户裁定）：
+      // 一次 createSnapshot 同时抓配置 + Electron 状态，不再需要单独备份。
+
       C.pruneSnapshots(root)
-      return json(res, 200, { ok: true, id: r.id, bytes: r.bytes, name: C.defaultName('manual', r.id) })
+      // 把状态信息告诉面板（2026-10-22：不再传「完整度」，Cookies 不进快照）
+      const es = r.meta?.estate
+      return json(res, 200, {
+        ok: true,
+        id: r.id,
+        bytes: r.bytes,
+        name: C.defaultName('manual', r.id),
+        estate: es
+          ? {
+            included: Boolean(es.included),
+            bytes: es.bytes ?? 0,
+            entries: (es.entries ?? []).length,
+          }
+          : null,
+      })
     } catch (e) {
       return json(res, 500, { error: String(e?.message ?? e) })
     }
@@ -1268,6 +1289,18 @@ function registerRoutes(ctx, ctxInfo) {
         return json(res, 200, { ok: true, removed: r.removed })
       }
 
+      // ⭐ 2026-10-23：只切换钉住状态（不动文件）
+      if (body.togglePin) {
+        const slot = body.slot ?? C.FIXED_SLOT_DEFAULT
+        const cur = C.readFixedSlot(root, slot)
+        if (!cur) return json(res, 400, { error: '当前没有固化副本' })
+        const mp = join(C.fixedSlotDir(root, slot), 'meta.json')
+        const meta = C.readJson(mp) ?? {}
+        meta.pin = body.togglePin === 'on'
+        C.writeJsonAtomic(mp, meta)
+        return json(res, 200, { ok: true, pin: meta.pin, fromName: meta.fromName })
+      }
+
       // 固化指定快照
       const id = body.id
       if (!id) return json(res, 400, { error: '缺少快照 id' })
@@ -1278,7 +1311,8 @@ function registerRoutes(ctx, ctxInfo) {
 
       let r
       try {
-        r = C.fixSnapshot({ root, entry: e, slot: body.slot })
+        // body.pin 为 true 时钉住；默认不钉住（跟随当天 daily）
+        r = C.fixSnapshot({ root, entry: e, slot: body.slot, pin: body.pin === true })
       } catch (err) {
         return json(res, 400, { error: String(err?.message ?? err) })
       }
@@ -1289,6 +1323,7 @@ function registerRoutes(ctx, ctxInfo) {
         files: r.files,
         bytes: r.bytes,
         dir: r.dir,
+        pin: body.pin === true,
       })
     } catch (e) {
       return json(res, 500, { error: String(e?.message ?? e) })

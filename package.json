@@ -1,6 +1,6 @@
 {
   "name": "dsh-fk-rollback",
-  "version": "1.4.0",
+  "version": "1.5.1",
   "description": "FK 回滚设置：DSH 配置快照与回滚。自动留痕、出问题能查、坏了能退回。保证 DSH 本体能启动、能输入输出、功能正常。",
   "type": "module",
   "main": "entry.js",
@@ -19,7 +19,9 @@
     "cordis.patch.yml",
     "dsh-rollback.mjs",
     "还原DSH配置.bat",
-    "README.md"
+    "README.md",
+    "install.mjs",
+    "安装.bat"
   ],
   "license": "MIT",
   "engines": {

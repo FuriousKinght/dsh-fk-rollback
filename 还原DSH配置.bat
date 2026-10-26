@@ -4,6 +4,8 @@ setlocal enabledelayedexpansion
 REM ============================================================
 REM  DSH config restore (FK rollback)  --  dsh-fk-rollback
 REM
+REM  Version: 1.5.1   (must match package.json; modules 1-6 ship as one)
+REM
 REM  This is the LAST-RESORT path: DSH is broken, the panel
 REM  will not open. This script needs only node.exe.
 REM
@@ -21,20 +23,51 @@ REM ============================================================
 set "SCRIPT_DIR=%~dp0"
 set "ROLLBACK_JS=%SCRIPT_DIR%dsh-rollback.mjs"
 
-REM -- DSH_HOME: explicit env wins; otherwise auto-detect. --
-REM    Do NOT hardcode a path here: the plugin is portable and may run
-REM    on another machine or a different drive.
+REM -- DSH_HOME detection. Order matters, and no path here is hardcoded --
+REM    to one machine: this script ships to other people.
+REM
+REM    1. DSH_HOME already set  -> trust it
+REM    2. the desktop app keeps a marker at
+REM         %APPDATA%\@deepseek-ai\dsh-desktop\desktop
+REM       holding the product name; when the app is installed its own
+REM       user data dir exists, and that dir's parent pair tells us which
+REM       profile root the app actually uses.
+REM    3. ~\.dsh           (official default)
+REM    4. a sibling of this script (portable copy next to the data)
+REM    5. finally ask the user rather than guessing
 if not defined DSH_HOME (
-  if exist "%USERPROFILE%\.dsh" (
+  if exist "%USERPROFILE%\.dsh\profiles" (
     set "DSH_HOME=%USERPROFILE%\.dsh"
-  ) else if exist "D:\dsh-data" (
-    set "DSH_HOME=D:\dsh-data"
-  ) else if exist "C:\dsh-data" (
-    set "DSH_HOME=C:\dsh-data"
+  ) else if exist "%SCRIPT_DIR%..\profiles" (
+    set "DSH_HOME=%SCRIPT_DIR%.."
+  ) else if exist "%LOCALAPPDATA%\dsh-data\profiles" (
+    set "DSH_HOME=%LOCALAPPDATA%\dsh-data"
   )
 )
+REM Last resort: look one level up and down the usual drive roots for a
+REM folder that actually contains \profiles. Kept as a loop so nothing is
+REM spelled to a specific drive letter.
+if not defined DSH_HOME (
+  for %%D in (C D E F) do (
+    if not defined DSH_HOME if exist "%%D:\dsh-data\profiles" set "DSH_HOME=%%D:\dsh-data"
+  )
+)
+if not defined DSH_HOME (
+  echo.
+  echo ============================================================
+  echo   [X] Cannot find the DSH data folder automatically.
+  echo ============================================================
+  echo.
+  echo   Set DSH_HOME to the folder that contains \profiles, then run:
+  echo.
+  echo     set DSH_HOME=C:\path\to\your\dsh-home
+  echo     "%NODEPATH%" "%ROLLBACK_JS%" restore --last-good
+  echo.
+  pause
+  exit /b 9
+)
 if defined DSH_HOME if not exist "%DSH_HOME%\profiles" (
-  echo   [!] DSH_HOME points to a folder without \profiles: %DSH_HOME%
+  echo   [X] DSH_HOME points to a folder without \profiles: %DSH_HOME%
   echo       Continuing anyway; dsh-rollback.mjs will report what it cannot find.
   echo.
 )
@@ -110,7 +143,7 @@ for /f "delims=" %%P in ('where node 2^>nul') do (
 REM -- 5. ask the user. Path may contain non-ASCII; swap the
 REM       console to UTF-8 just for this prompt and restore after.
 echo.
-echo   [!] node.exe not found automatically.
+echo   [X] node.exe not found automatically.
 echo.
 echo   Paste the full path to node.exe, or press Enter to abort:
 echo.
@@ -121,7 +154,7 @@ if not defined NODEPATH goto :node_notfound
 set "NODEPATH=!NODEPATH:"=!"
 if not exist "!NODEPATH!" (
   echo.
-  echo   [X] path does not exist: !NODEPATH!
+  echo   [X] path does not exist: %NODEPATH%
   goto :node_notfound
 )
 
@@ -145,6 +178,10 @@ echo ============================================================
 if "%RC%"=="0" (
   echo   [OK] restore finished
   echo.
+  echo   Restored the configuration AND the desktop state.
+  echo   The desktop state is rebuilt on next start; your account is
+  echo   stored separately in .credentials.yaml and is not affected.
+  echo.
   echo   Restart DSH to apply the restored configuration.
 ) else if "%RC%"=="4" (
   echo   [X] no usable snapshot found
@@ -157,7 +194,7 @@ if "%RC%"=="0" (
   echo.
   echo   Close DSH and try again.
 ) else if "%RC%"=="7" (
-  echo   [!] manual attention required
+  echo   [X] manual attention required
   echo.
   echo   Restore finished but DSH may still fail to start.
   echo   Check, in this order:
@@ -166,8 +203,18 @@ if "%RC%"=="0" (
   echo     3. DSH install directory - moved or deleted?
   echo.
   echo   If all look fine, reinstall DSH.
+  echo.
+  echo   --- If DSH reports "Web authentication failed" ---
+  echo   Snapshots now include the desktop state and restore it along
+  echo   with the config, so this case is normally covered.
+  echo.
+  echo   If it still fails, check what is wrong:
+  echo     "%NODEPATH%" "%ROLLBACK_JS%" check
+  echo.
+  echo   Last resort - rebuild the state ^(you will need to sign in^):
+  echo     "%NODEPATH%" "%ROLLBACK_JS%" estate --reset
 ) else if "%RC%"=="8" (
-  echo   [!] partially restored
+  echo   [X] partially restored
   echo.
   echo   See the output above for details.
 ) else (

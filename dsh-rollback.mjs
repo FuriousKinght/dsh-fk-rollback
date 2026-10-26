@@ -1,5 +1,10 @@
 #!/usr/bin/env node
 /**
+ * FK 回滚插件 · 模块二~六：命令行入口
+ *
+ * @version 1.5.1
+ */
+/**
  * FK 回滚设置 —— 命令行脚本（模块六）
  *
  * 纯 Node，零第三方依赖。DSH 崩了也能跑，这是最后的兜底手段。
@@ -22,6 +27,7 @@ import { dirname } from 'node:path'
 import * as C from './lib/core.mjs'
 import { runCheck, computeEffectivePlugins, listDshPackages, parsePatchSubset } from './lib/check.mjs'
 import { traceFile, listSessionSummaries } from './lib/trace.mjs'
+import * as E from './lib/estate.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
@@ -75,6 +81,31 @@ function cmdFix(opts) {
   const { root } = resolveCtx(opts)
   const idx = C.readIndex(root)
 
+  // --unpin：取消钉住，让启动钩子恢复自动跟随当天 daily
+  if (opts.unpin) {
+    const slot = opts.slot ?? C.FIXED_SLOT_DEFAULT
+    const cur = C.readFixedSlot(root, slot)
+    if (!cur) {
+      die(C.EXIT.NO_SNAPSHOT, '当前没有固化副本，无需取消钉住')
+    }
+    const mp = join(C.fixedSlotDir(root, slot), 'meta.json')
+    const meta = C.readJson(mp) ?? {}
+    const was = meta.pin === true
+    meta.pin = false
+    // 保留 fixedBy 原值，只改 pin
+    C.writeJsonAtomic(mp, meta)
+    console.log('')
+    if (was) {
+      console.log(`  ✅ 已取消钉住：${meta.fromName}`)
+      console.log('     下次 DSH 启动时会被当天的 daily 快照替换。')
+    } else {
+      console.log(`  ⓘ 这份副本本来就没钉住：${meta.fromName}`)
+      console.log('     它会在下次启动时被当天 daily 替换。')
+    }
+    console.log('')
+    return C.EXIT.OK
+  }
+
   // --show：查看当前固化状态
   if (opts.show) {
     const slots = C.listFixedSlots(root)
@@ -91,6 +122,15 @@ function cmdFix(opts) {
       const marker = s.slot === C.FIXED_SLOT_DEFAULT ? '  ← .bat 默认使用' : ''
       console.log(`\n  [${s.slot}]${marker}`)
       console.log(`    来源快照: ${m.fromName ?? '?'}（${m.fromId ?? '?'}）`)
+      // ⭐ 2026-10-23：钉住状态决定下次启动会不会被当天 daily 替换
+      if (m.pin === true) {
+        console.log(`    钉住:     📌 是 —— 启动时不会自动替换`)
+      } else {
+        console.log(`    钉住:     🔄 否 —— 下次启动会被当天 daily 替换`)
+      }
+      if (m.replacedFrom?.fromName) {
+        console.log(`    上次替换: ${m.replacedFrom.fromName}`)
+      }
       console.log(`    快照时间: ${m.fromCreatedAt ? new Date(Date.parse(m.fromCreatedAt)).toLocaleString('zh-CN') : '?'}`)
       console.log(`    固化于:   ${m.fixedAt ? new Date(Date.parse(m.fixedAt)).toLocaleString('zh-CN') : '?'}`)
       console.log(`    大小:     ${Math.round((m.bytes ?? 0) / 1024)} KB`)
@@ -119,7 +159,13 @@ function cmdFix(opts) {
 
   let r
   try {
-    r = C.fixSnapshot({ root, entry: e, slot: opts.slot })
+    // ⭐ 2026-10-23：pin 决定这份副本是否"钉住"
+    //   不钉住 → 下次启动会被当天的 daily 自动替换
+    //   钉住   → 一直保留，除非手动 --unpin
+    r = C.fixSnapshot({
+      root, entry: e, slot: opts.slot,
+      pin: Boolean(opts.pin),
+    })
   } catch (err) {
     die(C.EXIT.NO_SNAPSHOT, err.message)
   }
@@ -127,12 +173,166 @@ function cmdFix(opts) {
   console.log(`\n  ✅ 已固化`)
   console.log(`     来源快照: ${r.fromName}`)
   console.log(`     槽位:     ${r.slot}${r.slot === C.FIXED_SLOT_DEFAULT ? '（.bat 默认使用）' : ''}`)
-  console.log(`     文件:     ${r.files}/5 个，${Math.round(r.bytes / 1024)} KB`)
+  const cfgFiles = Math.min(r.files, C.SNAPSHOT_FILES.length)
+  console.log(`     配置:     ${cfgFiles}/5 个文件`)
+  if (r.estateCopied) {
+    console.log(`     状态:     ✅ 已包含（cookie / LevelDB，${Math.round(r.estateBytes / 1024)} KB）`)
+  } else {
+    console.log(`     状态:     ⚠️ 这份快照没有状态部分 —— .bat 只能还原配置`)
+  }
+  console.log(`     合计:     ${Math.round(r.bytes / 1024)} KB`)
   console.log(`     路径:     ${r.dir}`)
+  console.log('')
+  if (opts.pin) {
+    console.log('  📌 已钉住 —— .bat 会一直用这一份，启动钩子不会替换。')
+    console.log('     取消钉住：dsh-rollback.mjs fix --unpin')
+  } else {
+    console.log('  🔄 未钉住 —— 下次 DSH 启动时，会把当天的 daily 快照固化过来替换它。')
+    console.log('     想固定这一份：dsh-rollback.mjs fix ' + e.id + ' --pin')
+  }
   console.log('')
   console.log('  ⚠️ 从此 .bat 直接使用这份固定副本：')
   console.log('     · 快照池怎么顶替都不会影响它')
   console.log('     · 只有执行 `fix --clear` 才会取消')
+  console.log('')
+  return C.EXIT.OK
+}
+
+
+/**
+ * estate —— Electron 运行时状态体检 / 重置
+ *
+ * ⚠️ 为什么有这个命令（2026-10-22 事故）：
+ *   认证状态库（Cookies / shared_proto_db）被强杀进程写坏后，
+ *   DSH 报「Web authentication failed」，完全起不来。
+ *   而快照还原只覆盖 5 个配置文件，救不了这类故障。
+ *
+ * 用法：
+ *   estate                 只检查（只读，安全）
+ *   estate --reset         重置（需先完全退出 DSH）
+ *   estate --reset --dry-run  预演
+ *   estate --reset --force 跳过进程检查（不推荐）
+ */
+function cmdEstate(opts) {
+  // ── 重置模式（最后手段：备份也没有时才用）──
+  if (opts.reset) {
+    const dryRun = Boolean(opts['dry-run'])
+    console.log('')
+    console.log('  Electron 运行时状态重置' + (dryRun ? '【预演】' : ''))
+    console.log('  ' + '-'.repeat(62))
+
+    if (!dryRun && !opts.force) {
+      const run = E.isAppRunning()
+      console.log(`  DSH 进程：${run.reason}`)
+      if (run.running) {
+        console.log('')
+        die(C.EXIT.ARGS,
+          'DSH 还在运行 —— 状态文件被占用，删不掉。\n'
+          + '    请先【完全退出 DSH】，再跑这条命令。\n'
+          + '    ⚠️ 不要加 --force 硬来，那会留下半删状态的库，比现在更糟。')
+      }
+      console.log('')
+    }
+
+    const r = E.resetEstate({ dryRun, force: Boolean(opts.force) })
+    if (!r.ok && r.reason) die(C.EXIT.ARGS, r.reason)
+
+    if (dryRun) {
+      console.log('  将要处理的条目：')
+      for (const x of r.removed) {
+        console.log(`    · ${x.path}`)
+        console.log(`      ${x.what}`)
+      }
+      console.log('')
+      console.log('  ⚠️ 这是预演，未做任何修改。')
+      console.log('')
+      return C.EXIT.OK
+    }
+
+    console.log(`  备份目录：${r.backupDir}`)
+    console.log('')
+    if (r.removed.length > 0) {
+      console.log('  已重置：')
+      for (const x of r.removed) {
+        console.log(`    ✓ ${x.path}  (${Math.round((x.bytes ?? 0) / 1024)} KB)`)
+      }
+    }
+    if (r.failed.length > 0) {
+      console.log('')
+      console.log('  ❌ 失败：')
+      for (const x of r.failed) console.log(`    ${x.path}  ${x.reason}`)
+      return C.EXIT.NO_SNAPSHOT
+    }
+
+    console.log('')
+    console.log('  ✅ 完成。重新打开 DSH 会重建这些状态。')
+    console.log('  ⚠️ 浏览器会话凭据已重置（不影响账号登录态 —— 账号信息在 .credentials.yaml 里）')
+    console.log('')
+    return C.EXIT.OK
+  }
+
+  // ── 检查模式（默认，只读）──
+  const chk = E.checkEstate(opts.appData ? { appData: opts.appData } : {})
+
+  console.log('')
+  console.log('  Electron 运行时状态体检')
+  console.log('  ' + '-'.repeat(62))
+
+  if (!chk.ok) {
+    console.log(`  ⚠️ ${chk.reason}`)
+    if (chk.candidates) {
+      console.log('  试过这些位置：')
+      for (const c of chk.candidates) console.log(`    ${c}`)
+    }
+    console.log('')
+    console.log('  （这不是问题 —— 可能你还没启动过桌面版 DSH）')
+    console.log('')
+    return C.EXIT.OK
+  }
+
+  const run = E.isAppRunning()
+  console.log(`  目录：${chk.dir}`)
+  console.log(`  DSH：${run.reason}`)
+  console.log('')
+
+  if (chk.problems.length === 0 && chk.notices.length === 0) {
+    console.log('  ✅ 认证与状态库看起来正常')
+  }
+  if (chk.problems.length > 0) {
+    console.log('  ❌ 致命问题（会导致 DSH 起不来且找不到原因）：')
+    for (const p of chk.problems) {
+      console.log(`    · ${p.path}`)
+      console.log(`      ${p.message}`)
+    }
+    console.log('')
+  }
+  if (chk.notices.length > 0) {
+    console.log('  ⓘ 提示（一般不影响使用）：')
+    for (const p of chk.notices) console.log(`    · ${p.path}  —  ${p.message}`)
+    console.log('')
+  }
+
+  console.log('  条目明细：')
+  for (const it of chk.items) {
+    const flag = it.suspicious ? ' ⚠️' : ''
+    const sz = it.present ? (it.size === null ? '[目录]' : `${it.size} B`) : '不存在'
+    console.log(`    ${String(it.rel).padEnd(32)} ${sz.padEnd(12)}${flag}`)
+  }
+  console.log('')
+
+  if (chk.problems.length > 0) {
+    console.log('  👉 修复办法 —— 状态现在包含在快照里，直接还原即可：')
+    console.log('       1. 完全退出 DSH')
+    console.log('       2. dsh-rollback list                # 看有哪些快照')
+    console.log('       3. dsh-rollback restore <快照id>    # 配置 + 状态一起还原')
+    console.log('')
+    console.log('     如果所有快照都没有状态部分，只能重置（会清掉浏览器会话凭据）：')
+    console.log('       dsh-rollback estate --reset')
+    console.log('')
+    return C.EXIT.NO_SNAPSHOT
+  }
+
+  console.log('  💡 状态已自动包含在快照里，用 snapshot 备份、restore 还原。')
   console.log('')
   return C.EXIT.OK
 }
@@ -346,7 +546,18 @@ function cmdSnapshot(opts) {
   console.log(`     名称: ${r.meta.name}`)
   console.log(`     来源: ${C.ORIGIN_LABEL[r.meta.origin] ?? r.meta.origin}`)
   console.log(`     大小: ${Math.round(r.bytes / 1024)} KB`)
-  console.log(`     体检: ${report.overall}${report.issues.length ? `（${report.issues.length} 条提示）` : ''}\n`)
+  console.log(`     体检: ${report.overall}${report.issues.length ? `（${report.issues.length} 条提示）` : ''}`)
+
+  // 状态部分（2026-10-22 最终版：Cookies 不进快照，也不再提示）
+  const es = r.meta.estate
+  if (es?.included) {
+    const kb = Math.round((es.bytes ?? 0) / 1024)
+    const cnt = (es.entries ?? []).length
+    console.log(`     状态: ${kb} KB（${cnt} 个条目）`)
+  } else if (es) {
+    console.log(`     状态: 未包含（${es.reason ?? '未知原因'}）`)
+  }
+  console.log('')
   return C.EXIT.OK
 }
 
@@ -550,6 +761,25 @@ function cmdRestore(opts) {
     console.log(`    2. DSH 本体包：node_modules/@deepseek-ai/dsh-* 是否完整`)
     console.log(`    3. DSH 安装目录是否被移动`)
     console.log(`    都正常 → 请重装 DSH`)
+  }
+
+  // ⭐ 状态还原结果（2026-10-22 审计发现：之前没告诉用户）
+  const esr = r.estate
+  if (esr) {
+    if (esr.restored && esr.restored.length > 0) {
+      console.log(`\n  运行时状态已还原：${esr.restored.join('、')}`)
+      console.log(`    大小：${Math.round((esr.bytes ?? 0) / 1024)} KB`)
+      if (esr.skipped?.length) {
+        console.log(`    跳过：${esr.skipped.join('、')}`)
+        console.log(`          （这些条目在备份时就不存在，不是还原失败）`)
+      }
+    } else {
+      console.log(`\n  ⚠️ 运行时状态未还原：${esr.reason ?? '未知原因'}`)
+      console.log(`     配置已还原，但认证类故障可能仍然存在。`)
+      console.log(`     如果 DSH 报「Web authentication failed」，说明这份快照没带状态。`)
+    }
+  } else {
+    console.log(`\n  ⓘ 这份快照不含运行时状态（旧格式），只还原了配置。`)
   }
 
   console.log(`\n  ${'='.repeat(58)}`)
@@ -768,6 +998,10 @@ function showHelp() {
       --note <备注>               备注
       --origin <auto|ai|user>     强制指定来源（默认自动探测）
 
+  estate                    体检 Electron 运行时状态（认证库 / cookie 库 / 锁文件）
+  estate --reset            重置运行时状态（会清掉浏览器会话凭据；最后手段）
+                            ⚠️ 备份/还原不用它 —— 已并入 snapshot / restore
+
   ── 还原类 ──
     restore <id>                还原到指定快照
     restore --last-good         自动选最佳快照
@@ -779,6 +1013,14 @@ function showHelp() {
     sessions                    列出最近会话
 
   ── 维护类 ──
+  ── .bat 固化类 ──
+  fix <id> [--pin]            把某个快照固化为 .bat 的数据源
+    --pin                        钉住：一直用这一份，启动时不替换
+    （不加 --pin）                下次启动时自动换成当天的 daily
+  fix --unpin                 取消钉住，恢复跟随当天 daily
+  fix --show                  查看当前固化状态（含是否钉住）
+  fix --clear                 取消固化（.bat 将无法工作）
+
     prune                       清理过期快照
     oplog                       查看操作日志
       --tail <n>                  只看最后 N 条
@@ -812,13 +1054,14 @@ const COMMANDS = {
   fix: cmdFix,
   paths: cmdPaths,
   diagnose: cmdDiagnose,
+  estate: cmdEstate,
   oplog: cmdOplog,
 }
 
 function main() {
   const opts = parseArgs(process.argv.slice(2))
   if (opts.help || opts.h) { showHelp(); process.exit(C.EXIT.OK) }
-  if (opts.version || opts.v) { console.log('dsh-rollback v1.4.0'); process.exit(C.EXIT.OK) }
+  if (opts.version || opts.v) { console.log('dsh-rollback v1.5.1'); process.exit(C.EXIT.OK) }
 
   const cmd = opts._[0]
   const fn = COMMANDS[cmd]
