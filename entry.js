@@ -13,7 +13,7 @@
  *
  * @module dsh-fk-rollback
   *
- * @version 1.5.1
+ * @version 1.5.3
  * @module 宿主接线（模块一~六的 Http 端点与钩子）
  */
 
@@ -25,6 +25,7 @@ import { runCheck, computeEffectivePlugins } from './lib/check.mjs'
 import { listSessionSummaries, traceFile, configTimeline } from './lib/trace.mjs'
 import { logError, readErrorLog, buildDiagnosticBundle, writeDiagnosticBundle } from './lib/elog.mjs'
 import * as R from './lib/restart.mjs'
+import * as E from './lib/estate.mjs'
 
 /** 插件名（必须等于 package.json 的 name）。 */
 export const name = 'dsh-fk-rollback'
@@ -583,6 +584,227 @@ function registerRoutes(ctx, ctxInfo) {
     req.on('end', () => { try { resolve(JSON.parse(s || '{}')) } catch { resolve({}) } })
   })
 
+  /**
+   * 处理「重启助手留下的 Cookie 清理标记」。
+   *
+   * 助手指在 DSH 已退出、端口已释放的空窗期清过 Cookie，会留一个
+   * restart-helper/cookie-cleanup.json。本次启动就是清理后的第 1 次，
+   * 所以基线记成「当前 boot 数 - 1」：
+   *
+   *     估算 = 0 + (当前 boot 数 - (当前 boot 数 - 1)) = 1
+   *
+   * 正好等于「清理后启动 1 次 → 1 个新 cookie」。
+   * 幂等：处理完就删掉标记，重复调用什么都不做。
+   */
+  function consumeCookieMarker() {
+    try {
+      const { home, profile } = ctxInfo
+      const root = C.snapshotDir(home, profile)
+      const markerPath = join(home, 'restart-helper', 'cookie-cleanup.json')
+      if (!existsSync(markerPath)) return
+      const marker = JSON.parse(readFileSync(markerPath, 'utf8'))
+      const boots = (C.readBootLog(root).records ?? []).length
+      E.writeCookieBaseline(root, {
+        cookieCount: 0,
+        bootLogCount: Math.max(0, boots - 1),
+      })
+      // ⭐ 记一份「实测历史」：重启助手清理时看到的【真实数量】。
+      //
+      //   为什么需要它：DSH 运行时 Chromium 独占 Cookies 文件（实测
+      //   copyFileSync / readSync / sqlite 只读 / CDP 全部失败），
+      //   面板只能给推算值。而重启那一刻助手读到的是真数，
+      //   把真数留下来，用户就能拿推断值与实测值对照 —— 这比空口说
+      //   「这是估算」可信得多。
+      // marker 现在带完整实测快照（observed/headerBytes/ports/时间跨度…），
+      // 原样存档 —— 这是面板唯一的真实数据来源。
+      try {
+        const histPath = join(root, 'cookie-observed.json')
+        writeFileSync(histPath, JSON.stringify({
+          ...marker,
+          savedAt: new Date().toISOString(),
+        }, null, 2) + '\n', 'utf8')
+      } catch { /* 历史记录失败不影响主流程 */ }
+
+      try {
+        logError(root, {
+          level: 'info',
+          source: 'restart-helper',
+          op: 'cookie-cleanup',
+          message: `重启时实测 ${String(marker.observed ?? marker.removed ?? 0)} 个认证 Cookie，清理 ${String(marker.removed ?? 0)} 个`,
+          context: { at: marker.at, backupPath: marker.backupPath },
+        })
+      } catch { /* 忽略 */ }
+      rmSync(markerPath, { force: true })
+    } catch { /* 标记处理失败不影响任何东西 */ }
+  }
+
+  // ── GET/POST /proxy-env ── 代理环境变量诊断与修复（2026-11-14 事故）
+  //
+  // 为什么放在这里而不是只给 CLI：
+  //   用户遇到「所有模型都报 transport failed」时，第一反应是打开面板，
+  //   不是开命令行。修故障不能要求用户记住一条命令。
+  const proxyEnvHandler = async (req, res) => {
+    try {
+      const { home } = ctxInfo
+
+      // ── GET：诊断 ──
+      if (req.method === 'GET') {
+        const cur = E.getUserProxyEnv()
+        if (!cur.ok) {
+          return json(res, 200, {
+            ok: false, error: cur.error ?? '读不到用户级环境变量',
+            vars: [], dead: [], alive: [],
+          })
+        }
+        const names = Object.keys(cur.values)
+        if (names.length === 0) {
+          return json(res, 200, { ok: true, vars: [], dead: [], alive: [], clean: true })
+        }
+
+        // 按 host:port 归并并探活
+        const groups = new Map()
+        for (const k of names) {
+          const p = CK.parseProxyValue(cur.values[k])
+          const id = p.valid ? `${p.host}:${p.port}` : `bad:${cur.values[k]}`
+          if (!groups.has(id)) groups.set(id, { keys: [], parsed: p })
+          groups.get(id).keys.push(k)
+        }
+
+        const vars = []
+        const dead = []
+        const alive = []
+        for (const [, g] of groups) {
+          const entry = {
+            keys: g.keys,
+            value: cur.values[g.keys[0]],
+            host: g.parsed.valid ? g.parsed.host : null,
+            port: g.parsed.valid ? g.parsed.port : null,
+            parsed: g.parsed.valid,
+          }
+          if (!g.parsed.valid) {
+            entry.status = 'unparsable'
+            vars.push(entry)
+            continue
+          }
+          const isLocal = ['127.0.0.1', 'localhost', '::1', '[::1]']
+            .includes(String(g.parsed.host).toLowerCase())
+          if (!isLocal) {
+            entry.status = 'remote'          // 远程不探
+            alive.push(entry)
+          } else {
+            const probe = CK.isPortListeningSync(g.parsed.port)
+            entry.status = probe.listening ? 'alive' : 'dead'
+            if (probe.listening) alive.push(entry)
+            else dead.push(entry)
+          }
+          vars.push(entry)
+        }
+
+        return json(res, 200, {
+          ok: true,
+          vars, dead, alive,
+          clean: dead.length === 0 && vars.length === 0,
+          // 修复命令（给用户看，也方便复制）
+          fixHint: '删掉这些变量后【完全退出 DSH 再启动】',
+        })
+      }
+
+      // ── POST：修复 / 恢复 ──
+      if (req.method !== 'POST') return json(res, 405, { error: 'GET or POST' })
+
+      const body = await readJsonBody(req)
+      const action = body?.action
+
+      if (action === 'restore') {
+        const r = E.restoreUserProxyEnv({ home })
+        return json(res, 200, {
+          ok: r.ok,
+          action: 'restore',
+          restored: r.restored ?? [],
+          failed: r.failed ?? [],
+          backupPath: r.backupPath,
+          reason: r.reason,
+          note: '必须完全退出 DSH 再启动才会生效',
+        })
+      }
+
+      if (action === 'fix') {
+        // 只删「诊断出来是死的」那些 —— 不做全删
+        const deadKeys = Array.isArray(body?.keys)
+          ? body.keys.filter((k) => typeof k === 'string' && k !== '')
+          : []
+        if (deadKeys.length === 0) {
+          return json(res, 400, { error: '需要提供要删除的变量名（keys）' })
+        }
+        const r = E.clearUserProxyEnv({
+          home,
+          keys: deadKeys,
+          dryRun: Boolean(body?.dryRun),
+        })
+        return json(res, 200, {
+          ok: r.ok,
+          action: 'fix',
+          dryRun: Boolean(r.dryRun),
+          removed: r.removed ?? [],
+          failed: r.failed ?? [],
+          stillThere: r.stillThere ?? [],
+          backupPath: r.backupPath,
+          reason: r.reason,
+          note: '必须完全退出 DSH 再启动才会生效',
+        })
+      }
+
+      return json(res, 400, { error: '未知 action：' + String(action) })
+    } catch (e) {
+      return json(res, 500, { error: String(e?.message ?? e).slice(0, 200) })
+    }
+  }
+
+  // ── GET /auth-cookies ── 认证 Cookie 累积（独立端点，避免拖慢首屏）──
+  const authCookiesHandler = async (req, res) => {
+    try {
+      if (req.method !== 'GET') return json(res, 405, { error: 'only GET' })
+      const { home, profile } = ctxInfo
+      const root = C.snapshotDir(home, profile)
+
+      consumeCookieMarker()
+
+      let authCookies
+      try {
+        authCookies = await E.checkAuthCookies()
+        // 读不到内容时（DSH 运行中 Chromium 独占），用「基线 + 启动次数」估算。
+        // 实测精度约 ±4%（74 次启动 ↔ 71 个 cookie）。
+        if (!authCookies.readable) {
+          const boots = (C.readBootLog(root).records ?? []).length
+          const est = E.estimateAuthCookies(root, boots)
+          if (est) {
+            authCookies.estimate = est
+            authCookies.estimateBudget = E.COOKIE_BUDGET
+            authCookies.estimateRatio = (est.count * 228) / E.COOKIE_BUDGET
+          }
+          authCookies.totalBoots = boots
+        }
+      } catch (e) {
+        authCookies = {
+          ok: true, readable: false, running: null,
+          reason: '检查失败：' + String(e?.message ?? e).slice(0, 120),
+        }
+      }
+
+      // 附上「上次重启时助手实测到的真实数量」，供面板与推算值对照
+      try {
+        const histPath = join(root, 'cookie-observed.json')
+        if (existsSync(histPath)) {
+          authCookies.lastObserved = JSON.parse(readFileSync(histPath, 'utf8'))
+        }
+      } catch { /* 忽略 */ }
+
+      return json(res, 200, authCookies)
+    } catch (e) {
+      return json(res, 500, { error: String(e?.message ?? e) })
+    }
+  }
+
   // ── GET /info ── 体检 + 状态
   const infoHandler = async (req, res) => {
     try {
@@ -613,10 +835,29 @@ function registerRoutes(ctx, ctxInfo) {
       )
 
       const total = entries.reduce((s, e) => s + (e.size ?? 0), 0)
+
+      // ⭐ v1.5.2：认证 Cookie 累积检测
+      //
+      // 2026-10-26 事故：DSH 每次启动用 sha256(host:端口) 生成 cookie 名，
+      // 旧的不清理 → 累积 71 个 → 请求头 16,584 B > Node 上限 16,384
+      // → HPE_HEADER_OVERFLOW → "Web authentication failed"。
+      //
+      // ⚠️ DSH 运行时 Cookies 被 Chromium 独占锁定，读不到内容。
+      //    此时 readable=false，面板显示「需退出 DSH 才能检查」，
+      //    这是预期行为，不是错误。
+      // ⭐ v1.5.2 性能优化（2026-10-27）：
+      //   Cookie 检测原本在这里 await，实测让首屏多等 1.7 秒
+      //   （其中 1.4 秒花在「尝试打开被 Chromium 锁住的 SQLite」上）。
+      //   现在拆到 GET /auth-cookies，面板先渲染，再异步补 Cookie 那一行。
+      consumeCookieMarker()
+
       return json(res, 200, {
         profile,
         dshVersion: DSH_VERSION,
         check: report,
+        // 保持字段存在（前端兼容），但始终为 null —— 真实数据走 /auth-cookies
+        authCookies: null,
+        hasAuthCookies: true,
         entries,
         total,
         dir: root,
@@ -625,6 +866,29 @@ function registerRoutes(ctx, ctxInfo) {
         policy: idx.policy ?? { maxCheckpoints: 50, maxDays: 30 },
         // ⭐ 固化状态（.bat 用的那份固定数据源）
         fixed: C.readFixedSlot(root),
+        // ⭐ 最佳回滚点（2026-10-29）：体检发现问题时，面板一键回滚到它
+        //
+        //   为什么需要：用户的原话是「检测到问题可以直接回滚」。
+        //   装插件后如果体检报 fatal，用户不该自己去快照列表里翻——
+        //   直接给一个「最该回到的地方」。
+        //
+        //   复用 C.pickLastGood（CLI restore --last-good 的同一套逻辑）：
+        //   今天的 daily 优先（= 当天首次启动的状态 = 装插件之前），
+        //   其次最近的 daily，并排除 broken。
+        lastGood: (() => {
+          try {
+            const lg = C.pickLastGood(root, home, profile, bootLog)
+            if (!lg?.entry) return null
+            return {
+              id: lg.entry.id,
+              name: lg.entry.name ?? lg.entry.id,
+              createdAtMs: lg.entry.createdAtMs ?? null,
+              level: lg.level,
+              reason: lg.reason,
+            }
+          } catch { return null }
+        })(),
+
         // ⭐ 路径信息（面板上显示 .bat 脚本在哪 —— 用户要求）
         paths: (() => {
           try {
@@ -1330,6 +1594,83 @@ function registerRoutes(ctx, ctxInfo) {
     }
   }
 
+  // ── POST /clean-cookies ── 清理累积的认证 Cookie（v1.5.2）
+  //
+  // 对应 2026-10-26 事故的修复动作。
+  // 只能在 DSH 完全退出后执行 —— 运行时 Cookies 被 Chromium 独占。
+  // 但面板还在跑，说明 DSH 正在运行，所以这个端点只能：
+  //   · 返回当前可清理的数量（预览）
+  //   · 给出「怎么真正清」的指引（退出 DSH → 双击 .bat）
+  //
+  // 真正执行清理的是 CLI / .bat（那时 DSH 已退出）。
+  const cleanCookiesHandler = async (req, res) => {
+    try {
+      if (req.method !== 'POST') return json(res, 405, { error: 'only POST' })
+
+      let body = {}
+      try {
+        const chunks = []
+        for await (const c of req) chunks.push(c)
+        if (chunks.length > 0) body = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      } catch { body = {} }
+
+      const dryRun = body.dryRun !== false   // 默认预演，防止误触
+
+      // ① 先看能不能读
+      const probe = await E.checkAuthCookies()
+      if (!probe.readable) {
+        return json(res, 200, {
+          ok: false,
+          needExit: true,
+          reason: probe.reason ?? 'Cookies 内容读不到',
+          // 面板在跑 → DSH 一定在运行 → 必须退出
+          hint: 'DSH 正在运行，Cookie 内容读不到（Chromium 独占锁定）。'
+            + '请完全退出 DSH，然后双击插件目录里的「清除旧Cookies.bat」。',
+          batPath: (() => {
+            try {
+              return join(dirname(fileURLToPath(import.meta.url)), '清除旧Cookies.bat')
+            } catch { return null }
+          })(),
+        })
+      }
+
+      // ② 能读 → 走清理（dryRun 时只报告）
+      const r = await E.cleanAuthCookies({ dryRun })
+
+      // 清理成功 → 写基线，供以后在运行中估算
+      if (r.ok && !dryRun && r.removed > 0) {
+        try {
+          const root = C.snapshotDir(ctxInfo.home, ctxInfo.profile)
+          const bootLog = C.readBootLog(root)
+          E.writeCookieBaseline(root, {
+            cookieCount: r.after ?? 0,
+            bootLogCount: (bootLog.records ?? []).length,
+          })
+        } catch { /* 基线写失败不影响清理结果 */ }
+      }
+      return json(res, 200, {
+        ok: r.ok,
+        dryRun,
+        removed: r.removed ?? 0,
+        wouldRemove: r.wouldRemove ?? 0,
+        totalBefore: r.totalBefore ?? null,
+        after: r.after ?? null,
+        backupPath: r.backupPath ?? null,
+        reason: r.reason ?? null,
+        needExit: false,
+      })
+    } catch (e) {
+      try {
+        logError(C.snapshotDir(ctxInfo.home, ctxInfo.profile), {
+          level: 'error', source: 'route', op: '/clean-cookies',
+          message: `清理 Cookie 失败: ${e?.message ?? e}`,
+          error: e instanceof Error ? e : undefined,
+        })
+      } catch { /* 忽略 */ }
+      return json(res, 500, { error: String(e?.message ?? e) })
+    }
+  }
+
   const routes = [
     ['/fix', fixHandler, 'exact'],
     ['/errors', errorsHandler, 'exact'],
@@ -1337,6 +1678,8 @@ function registerRoutes(ctx, ctxInfo) {
     ['/config-changes', configChangesHandler, 'exact'],
     ['/acknowledge', ackHandler, 'exact'],
     ['/info', infoHandler, 'exact'],
+    ['/auth-cookies', authCookiesHandler, 'exact'],
+    ['/proxy-env', proxyEnvHandler, 'exact'],
     ['/snapshot', snapshotHandler, 'exact'],
     ['/restore', restoreHandler, 'exact'],
     ['/trace', traceHandler, 'exact'],
@@ -1348,6 +1691,7 @@ function registerRoutes(ctx, ctxInfo) {
     ['/policy', policyHandler, 'exact'],
     ['/export', exportHandler, 'exact'],
     ['/health-history', healthHistoryHandler, 'exact'],
+    ['/clean-cookies', cleanCookiesHandler, 'exact'],
   ]
 
   for (const [suffix, handler, kind] of routes) {

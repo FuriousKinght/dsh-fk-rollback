@@ -393,19 +393,20 @@ fix --show
 每个文件头部都有 `@version`，`.bat` 用 `REM Version:`，都必须等于 `package.json` 的 `version`：
 
 ```text
-entry.js                    @version 1.5.1
-lib/client.js               @version 1.5.1
-lib/check.mjs               @version 1.5.1
-lib/estate.mjs              @version 1.5.1
-lib/trace.mjs               @version 1.5.1
-lib/core.mjs                @version 1.5.1
-lib/restart.mjs             @version 1.5.1
-lib/elog.mjs                @version 1.5.1
-dsh-rollback.mjs            @version 1.5.1
-lib/relaunch-helper.cjs     @version 1.5.1
-install.mjs                 @version 1.5.1
-还原DSH配置.bat              REM Version: 1.5.1
-package.json                "version": "1.5.1"
+entry.js                    @version 1.5.3
+lib/client.js               @version 1.5.3
+lib/check.mjs               @version 1.5.3
+lib/estate.mjs              @version 1.5.3
+lib/trace.mjs               @version 1.5.3
+lib/core.mjs                @version 1.5.3
+lib/restart.mjs             @version 1.5.3
+lib/elog.mjs                @version 1.5.3
+dsh-rollback.mjs            @version 1.5.3
+lib/relaunch-helper.cjs     @version 1.5.3
+install.mjs                 @version 1.5.3
+还原DSH配置.bat              REM Version: 1.5.2
+清除旧Cookies.bat            REM Version: 1.5.2
+package.json                "version": "1.5.2"
 ```
 
 ### 发版检查清单
@@ -432,6 +433,1999 @@ UTF-8 中文和框线字符会被拆成乱码再当命令执行。版本行只�
 ---
 
 ## 更新记录
+
+### v1.5.3（2026-11-14）
+
+**新增：代理环境变量检测 + 一键修复（体检第三行）**
+
+对应 2026-11-14 的事故 —— 这是**第一个不在配置文件里**的故障成因。
+
+#### 病因：环境变量指向了没启动的代理
+
+```text
+用户级环境变量：
+  HTTP_PROXY  = http://127.0.0.1:7897
+  HTTPS_PROXY = http://127.0.0.1:7897
+
+而 127.0.0.1:7897 没有任何进程监听（代理软件没开）
+```
+
+DSH 0.2.2 起新增的全局代理策略模块会在启动时读这两个变量，把进程内的 undici 全局 dispatcher 换成指向该代理的 `ProxyAgent`。代理不可达 → 每一条出站 HTTPS 请求全部失败 → **所有 provider 一起挂**。
+
+#### 为什么原来的报错极具误导性
+
+从 asar 挖出的源码：
+
+```js
+} catch (error) {
+  if (error instanceof LlmError) throw error;
+  throw new LlmError('DeepSeek Messages transport failed', 'TRANSPORT', { cause: error });
+}
+```
+
+任何 provider 的底层网络异常都被统一包装成这一条。字面上写着 "DeepSeek"，所以第一反应必然是「官方 API 挂了」——
+
+**实际排查时换模型、换 provider、查 `.credentials.yaml`、重装 DSH、回滚快照，全都白试。**
+
+#### 为什么回滚快照救不了
+
+```text
+变量存在注册表 HKCU\Environment
+   ↓
+不在 profile 里，不在 DSH_HOME 里
+   ↓
+快照只备份 5 个配置文件 → 碰不到它
+   ↓
+重启也没用 —— 注册表值不会因重启 DSH 而改变
+```
+
+**而且本质上是「当下状态」问题，不是「历史快照」问题：**
+
+```text
+配置文件坏了  → 还原成三天前的样子 → 好了 ✅
+环境变量坏了  → 还原成三天前的样子 → 还是坏的 ❌
+（因为三天前那个代理可能是开着的）
+```
+
+#### 三条新增能力
+
+**① `proxy-env-dead` 检查（fatal，接在 runCheck 里）**
+
+```text
+判据（保守，避免误报）：
+  · 只认 127.0.0.1 / localhost / ::1 —— 远程代理探不通可能只是防火墙
+  · 端口连不上才报
+  · 变量没设置 → 什么都不做
+  · 大小写 6 种变体全认（HTTP_PROXY / http_proxy / ...）
+```
+
+**探活方式用同步 `netstat`，不是异步 socket：**
+
+```text
+runCheck() 是同步函数，有 12 处调用点
+（entry.js 7 处 + dsh-rollback.mjs 5 处）
+   ↓
+为一个端口探测把全部改成 async → 改动面太大
+   ↓
+netstat -ano -p TCP 一次约 30ms，够用
+```
+
+**② `core` 命令改名为 `proxy` 命令（CLI）**
+
+```bash
+dsh-rollback proxy                    # 诊断
+dsh-rollback proxy --fix --dry-run    # 预演
+dsh-rollback proxy --fix              # 真删（先备份）
+dsh-rollback proxy --restore          # 从备份反悔
+```
+
+**③ 面板第三行【修复代理】—— 整行就是按钮**
+
+```text
+【体检】 ✅ 一切正常（另有 8 项正常状态，无需处理）  [测试弹窗] [体检] 16:10:33
+【认证 Cookie】 约 1 个 / 约上限 70 个 ⓘ
+┌──────────────────────────────────────────────────────────────┐
+│ 【修复代理】 代理导致所有模型报 transport failed 时点这里…  › │
+└──────────────────────────────────────────────────────────────┘
+```
+
+#### 为什么代理检查放【体检】里、修复单独一行
+
+用户 2026-11-14 的原话：
+
+> 「第三行【修复代理】是按钮，就是真的修复代理，
+>   然后这个代理检查，放在体检区」
+
+**所以：**
+
+| 关注点 | 归属 | 理由 |
+|---|---|---|
+| 代理**是否正常** | 【体检】 | 它是「配置是否健康」的一部分 |
+| 代理**怎么修** | 第三行按钮 | 它是一个动作，不是状态 |
+
+**刻意不把代理并进【体检】那一行显示，而是分成三行：**
+
+```text
+【体检】      = profile 的 5 个配置文件
+【认证 Cookie】= Chromium 状态库
+【修复代理】  = Windows 注册表
+```
+
+```text
+如果混成一行：
+  配置全对、代理是死的
+     ↓
+  显示「✅ 一切正常」
+     ↓
+  但模型照样全挂
+     ↓
+  ❌ 这句话就不可信了
+```
+
+#### 【体检】按钮加了时间戳
+
+用户 2026-11-14 反馈：
+
+> 「这个体检边上也要加个时间，不然以为按了没反应」
+
+**因为体检结果往往是「✅ 一切正常」这种静态文字，点完看不出任何变化。**
+
+```text
+未体检过  → [体检] 未体检
+检查中    → [检查中…] 进行中…
+跑完      → [体检] 16:10:33    ← 时间变了 = 真跑了
+悬停      → 上次体检完成于 2026/11/14 16:10:33
+```
+
+**关键点：即使结果是「一切正常」也要更新时间戳**，否则用户还是会以为按钮坏了。
+
+#### 安全设计
+
+| 项 | 做法 |
+|---|---|
+| **只删指定键** | 不做「全删」这种危险默认 |
+| **先备份** | 原值写进 `proxy-env-backup.json`；写备份失败就不删 |
+| **可预演** | `--dry-run` 只显示不动手 |
+| **可反悔** | `--restore` 从备份恢复 |
+| **删后复查** | 再读一遍注册表确认真的没了 |
+| **只杀死的** | 代理在运行（端口有监听）→ 一个都不删 |
+
+**⚠️ 为什么读注册表而不是 `process.env`：**
+
+```text
+process.env 是 DSH 启动时继承的快照
+   ↓
+用户改完变量后，DSH 进程里还是旧值
+   ↓
+判断「注册表里有什么」必须直接读 HKCU\Environment
+```
+
+#### 实测
+
+**单元测试（21 项）：**
+
+```text
+isPortListeningSync      7897 无监听 ✅ / 58504 有监听 ✅
+parseProxyValue          7 种输入全对（含 socks5、无 scheme、空串、坏 URL）
+空环境                   不报警 ✅
+事故原样（7897 死）       报 1 条 fatal ✅
+代理活着                 不报警 ✅
+远程代理                 不探不报 ✅
+大小写 6 种变体           全部报出 ✅
+```
+
+**CLI 端到端（8 步）：**
+
+```text
+① 无变量        exit=0  「当前用户没有任何代理环境变量」
+② 事故环境      exit=4  准确报出「代理没有运行 ← 这就是故障原因」
+③ --fix --dry-run       列出将删 4 个；磁盘未变 ✅
+④ --fix 真就干  exit=0  删 4 个 + 写备份
+⑤ 注册表验证            HTTP_PROXY / HTTPS_PROXY 都变空 ✅
+⑥ 备份内容              {"HTTP_PROXY":"http://127.0.0.1:7897", ...}
+⑦ 修复后再诊断  exit=0  「干净状态」✅
+⑧ --restore     exit=0  4 个全部恢复 ✅
+```
+
+**面板 UI（9 项）：**
+
+```text
+整行是 <button>            ✅
+内部只有一个 button         ✅
+点整行触发 doFixProxyAll    ✅
+修复中 disabled            ✅
+【测试弹窗】+【体检】两个按钮  ✅
+未体检 / 进行中 / 时间戳     ✅ 三种状态
+补零格式 09:05:03          ✅
+```
+
+#### 过程中修正的两个自身错误
+
+**① 误报 cosmokit / schemastery**
+
+第一版把 `cosmokit` / `schemastery` 的副本报成 warn。用户质疑后查 asar 源码：
+
+```text
+dsh-scope          Symbol.for = 0   → 按对象身份判 → 多一份必冲突
+dsh-system-prompt  Symbol.for = 0   → 同上
+dsh-llm            Symbol.for = 0   → 同上
+cordis             Symbol.for = 21  → 跨实例安全
+cosmokit           Symbol.for = 1   → 跨实例安全
+schemastery        Symbol.for = 2, globalThis = 9 → 跨实例安全
+```
+
+**教训：报「重复安装」不等于报「有害」。只有验证过危害的才该报警。**
+
+**② 两步操作**
+
+第一版设计是「点【一键修复】→ 弹 toast → 再点 toast 里的【一键修复】」。用户问：
+
+> 「代理出问题了，这个修复代理按钮呢？我按哪？」
+
+**说明这个两步很蠢。改成：按钮本身就是动作，点一下直接删，弹窗只负责报结果。**
+
+---
+
+### v1.5.2（2026-10-26）
+
+**新增：认证 Cookie 累积检测 + 一键清理**
+
+对应 2026-10-26 的真实事故，这是认证类故障的**第二个独立成因**。
+
+#### 病因：Cookie 名按端口生成，旧的不清理
+
+DSH 每次启动都会：
+
+```text
+① Host 监听一个【动态端口】（如 63360）
+② 用 sha256("127.0.0.1:63360") 生成 cookie 名 → "dsh-auth-XXXX"
+③ Chromium 把 cookie 存进 Network/Cookies（host_key = 127.0.0.1）
+④ 下次启动端口变成 64245 → 名字不同 → 又存一个
+⑤ 旧 cookie 【永不清理】
+```
+
+源码依据（`dsh-client-connection`）：
+
+```js
+const COOKIE_PREFIX = "dsh-auth-"
+
+function requestAudience(headers, secure) {
+    const host = header(headers, "host");
+    const url = new URL(`${secure ? "https:" : "http:"}//${host}`);
+    return secure ? url.origin : url.host;   // ← 含端口
+}
+
+function cookieName(authority) {
+    return COOKIE_PREFIX + encodeBase64Url(sha256(authority));
+}
+```
+
+#### 为什么偏偏是 71 个崩溃
+
+```text
+每个 cookie 在请求头里占：name(52) + '=' + value(173) + '; ' = 228 字节
+
+Node.js maxHeaderSize = 16,384 字节
+其他请求头预留        ≈    400 字节
+留给 Cookie           = 15,984 字节
+                      ÷ 228 = 70.1 个
+```
+
+**实测（Node 24.21.0，真实 HTTP 服务端）：**
+
+```text
+70 个 | 总头 16,356 B (15.97 KB) -> 200 OK
+71 个 | 总头 16,584 B (16.20 KB) -> HPE_HEADER_OVERFLOW + ECONNRESET
+```
+
+崩溃链条：
+
+```text
+请求头超限 → Node 抛 HPE_HEADER_OVERFLOW → 断连
+    ↓
+Electron net.fetch 收到 ECONNRESET（不是 4xx）
+    ↓
+connectDesktopWelcome: if (!authenticated.ok) throw
+    ↓
+"desktop welcome: Web authentication failed"
+```
+
+#### 实测累积速度
+
+读取事故备份 `dsh-cookie-backup-20261026-185933`：
+
+```text
+总 cookie:    71
+dsh-auth-*:   71
+唯一端口:     71 / 71   （一个不重复）
+签发跨度:     2026-10-22 08:43:55 → 10-26 18:45:16（4.42 天）
+平均频率:     每天 16.1 次启动
+最近 24 小时: 31 次
+```
+
+**所以：每天重启 16 次 → 4.4 天必然崩。这是必然而非偶然。**
+
+#### 性能优化：不拖慢面板首屏（2026-10-27）
+
+**问题：** 加了 Cookie 检测后，每次打开面板都要等一小会（显示「正在读取…」）。
+
+**实测根因：**
+
+```text
+checkAuthCookies() 单次耗时 1715 ms
+  其中：
+    locateUserData()        0 ms
+    isAppRunning()        271 ms   （tasklist 是外部进程）
+    import node:sqlite      0 ms
+    尝试打开 SQLite       1444 ms   ← 明知被 Chromium 锁住，必然失败，还是等了 1.4 秒
+```
+
+**三个优化：**
+
+**① 快路径：知道的答案就不要去试**
+
+```js
+// DSH 在运行时 Chromium 必然独占 Cookies 库，尝试打开必然失败。
+// 而那次失败的尝试要 1400ms —— 凭空让面板首屏卡 1.4 秒。
+if (running && opts.force !== true && opts.appData === undefined) {
+  return {
+    ok: true, readable: false, running: true,
+    reason: 'DSH 正在运行，Cookies 库被 Chromium 独占锁定 —— 请完全退出 DSH 后重跑',
+  }
+}
+```
+
+**② `isAppRunning` 加 3 秒缓存**
+
+```js
+// tasklist 每次约 270ms，而面板首屏、估算、清理前置检查
+// 会在几秒内反复问同一个问题 —— 答案显然不会变。
+let _appRunCache = null
+let _appRunCacheAt = 0
+const APP_RUN_CACHE_MS = 3000
+```
+
+**③ 端点分离：`/info` 不再阻塞**
+
+```text
+之前：GET /info  → await checkAuthCookies()  → 首屏等 1.7 秒
+现在：GET /info  → 立即返回（authCookies: null）
+      GET /auth-cookies → 异步补 Cookie 那一行
+```
+
+前端：
+
+```js
+async function refresh() {
+  const d = await api('/info')          // 首屏数据，立即渲染
+  setState({ loading: false, data: d, error: null })
+  // Cookie 状态故意不 await —— 附加信息不该拖慢首屏
+  api('/auth-cookies')
+    .then((r) => setCookieInfo(r && !r.error ? r : null))
+    .catch(() => setCookieInfo(null))
+}
+```
+
+**优化效果（实测）：**
+
+```text
+                      优化前        优化后
+checkAuthCookies       1715 ms   →   261 ms（首次）
+                                    1 ms（缓存命中）
+首屏阻塞                 1715 ms   →     0 ms（异步）
+```
+
+**同时修正的逻辑瑕疵：**
+
+指定 `appData` 时不走快路径 —— 调用方明确要求读某个目录
+（测试、多 userData、排障），不该被「本机 DSH 在跑」挡回去。
+
+**慢路径完好性验证：**
+
+```text
+指定 appData 的真读路径:  2 ms,  readable=true
+  auth=71  bytes=16188  level=fatal  ratio=101.3%  ports=71
+```
+
+---
+
+#### 新增检测
+
+**面板**（设置 → 侧边栏「FK回滚设置」→ 快照管理顶部）会显示一行：
+
+```text
+【认证 Cookie】 ⓘ 2 个 dsh-auth-*（估算）· 请求头占上限 3%
+               DSH 运行中读不到 Cookie 内容，这是推算值
+               （自 2026/10/27 19:06 清理后启动 2 次，每次 +1）
+```
+
+**三种展示形态：**
+
+| 情况 | 显示 |
+|---|---|
+| 能读到（DSH 未运行） | `✅ 2 个 dsh-auth-* · 请求头占上限 3%` —— 精确值 |
+| 读不到但有基线 | `ⓘ 2 个 dsh-auth-*（估算）` —— 基线 + 启动次数推算 |
+| 读不到且无基线 | `ⓘ 数量未知` + 指引用 `.bat` 检查一次 |
+
+**为什么运行时读不到还要估算：**
+
+```text
+DSH 运行时 Cookies 被 Chromium 独占，读不到内容（实测 4 种方式全失败）
+   ↓
+但面板在跑 = DSH 正在运行 = 恰好是读不到的状态
+   ↓
+如果只显示「读不到」，用户在面板上永远看不到任何数量概念
+   ↓
+所以用「基线 + 启动次数」估算
+```
+
+**估算精度（实测）：**
+
+```text
+某时间段内 boot-log 记录 74 条
+对应实际 cookie 71 个
+偏差 +3（约 4%）
+   ↓
+「每次启动 ≈ +1 个」成立，可用于估算
+```
+
+**基线是什么：**
+
+```json
+// <DSH_HOME>/rollback-snapshots/<profile>/cookie-baseline.json
+{
+  "at": "2026-10-26T19:06:00",
+  "cookieCount": 0,        // 清理后的实际数量
+  "bootLogCount": 164      // 当时的 boot-log 总条数
+}
+```
+
+估算公式：
+
+```text
+当前估算 = 基线数量 + (当前 boot 数 - 基线的 boot 数)
+```
+
+基线只在 `--clean-cookies` 清理成功后写入。
+第一次使用时会显示「数量未知」，跑一次清理后就有基线了。
+
+---
+
+`estate` 命令也会检查（输出更详细）：
+
+```bash
+dsh-rollback estate
+```
+
+输出（能读到 Cookie 时）：
+
+```text
+── 认证 Cookie 累积 ──
+  🔴 71 个 dsh-auth-*（请求头 16188 B / 上限 15984 B，占 101.3%）
+     已达上限 —— 这就是 DSH 起不来的原因
+     涉及 71 个不同端口（每次启动换一个端口 → 多一个 cookie）
+     最早 2026/10/22 08:43:55  →  最晚 2026/10/26 18:45:16
+
+     修复：完全退出 DSH，然后运行
+       dsh-rollback estate --clean-cookies
+     或直接双击插件目录里的「清除旧Cookies.bat」
+```
+
+分级阈值（按预算占比）：
+
+| 级别 | 占比 | 约合数量 | 含义 |
+|---|---|---|---|
+| `normal` | < 85% | < 59 个 | 正常 |
+| `warn` | ≥ 85% | ≥ 59 个 | 开始累积，建议清理 |
+| `error` | ≥ 95% | ≥ 66 个 | 再重启几次就崩 |
+| `fatal` | ≥ 100% | ≥ 70 个 | 已经会崩 |
+
+⚠️ **检查窗口限制（重要）**
+
+```text
+DSH 运行时  → Cookies 被 Chromium 独占锁定 → 读不到
+DSH 未运行  → 可读（node:sqlite 只读打开）
+```
+
+**但这不是问题：唯一有意义的检测时刻（DSH 起不来）正好是可读状态。**
+
+DSH 运行时跑 `estate`，会明确提示：
+
+```text
+── 认证 Cookie 累积 ──
+  ⓘ DSH 正在运行，Cookies 库被 Chromium 独占锁定 —— 请完全退出 DSH 后重跑
+```
+
+实测四种运行时读取方式全部失败：
+
+| 方式 | 结果 |
+|---|---|
+| `copyFileSync` | ❌ `EBUSY` |
+| `sqlite3 mode=ro&immutable=1` | ❌ `unable to open database file` |
+| Win32 共享读 | ❌ `Win32Error=32` |
+| **看文件大小** | ❌ **不可靠**（见下） |
+
+**文件大小不是可靠信号：**
+
+```text
+事故前（71 个 cookie）:  53,248 B
+清理后（0 个 cookie）:   53,248 B   ← 完全一样
+```
+
+原因：SQLite 的 `DELETE` 不自动 `VACUUM`，删除后保留空闲页。
+
+#### 新增清理
+
+```bash
+# 预演（只报数字）
+dsh-rollback estate --clean-cookies --dry-run
+
+# 真清理（必须先完全退出 DSH）
+dsh-rollback estate --clean-cookies
+```
+
+清理做的事：
+
+```text
+① 检查 DSH 是否已退出（未退出直接拒绝）
+② 备份 Cookies 到 <DSH_HOME>/rollback-snapshots/<profile>/cookie-backups/<时间戳>/
+③ DELETE FROM cookies
+     WHERE host_key IN ('127.0.0.1','localhost')
+       AND name LIKE 'dsh-auth-%'
+   ⚠️ 只删认证 cookie：
+      · host 限定本机（不碰其他站点）
+      · name 限定 dsh-auth-（不碰同域其他 cookie）
+④ 清理 0 字节的 Cookies-journal
+⑤ 复核剩余数量
+```
+
+#### 两个插件的重启都会记录实测数据
+
+**`dsh-fk-restart-button`（侧边栏按钮）和本插件的「重启 DSH」都走同一条数据流。**
+
+```text
+你点哪个重启按钮
+   ├─ 侧边栏底部按钮 → dsh-fk-restart-button/lib/relaunch-helper.cjs
+   └─ 面板「重启 DSH」→ dsh-fk-rollback/lib/relaunch-helper.cjs
+              │
+              │ 两个 helper 写【同一个文件】
+              ▼
+   <DSH_HOME>/restart-helper/cookie-cleanup.json
+       实测快照：observed / headerBytes / ports / oldest / newest / triggeredBy
+              │
+              │ 只有本插件的 entry.js 消费它
+              ▼
+   <DSH_HOME>/rollback-snapshots/<profile>/cookie-observed.json
+              │
+              ▼
+   设置 → FK回滚设置 → hover【认证 Cookie】→ 看到实测详情
+```
+
+**为什么两个插件共用 `restart-helper/` 目录：**
+
+```text
+两个插件早已约定这个公共位置（helperDir 都是 <DSH_HOME>/restart-helper）。
+放在一起 = 不管谁触发重启，数据都落到同一个地方，
+不会出现「点 A 存 A 目录、点 B 存 B 目录」的分裂。
+```
+
+**`triggeredBy` 字段用来区分来源：**
+
+```json
+{
+  "observed": 4,
+  "headerBytes": 912,
+  "ports": [53975, 64245, 56306, 63890],
+  "oldest": 1792629835700,
+  "newest": 1793055716000,
+  "triggeredBy": "dsh-fk-rollback (面板「重启 DSH」)",
+  ...
+}
+```
+
+取值有两种：
+
+```text
+"dsh-fk-rollback (面板「重启 DSH」)"       ← 面板按钮
+"dsh-fk-restart-button (侧边栏按钮)"       ← 侧边栏按钮
+```
+
+面板 hover 里显示为「触发来源：…」。
+
+**要求：**
+
+| 组合 | 数据产生 | 数据可见 |
+|---|---|---|
+| 两个都装 | ✅ 点哪个都行 | ✅ 面板 hover 看 |
+| 只装 `dsh-fk-rollback` | ✅ | ✅ |
+| 只装 `dsh-fk-restart-button` | ✅（写 marker） | ❌ 没有消费者 |
+
+**所以推荐两个一起装** —— 侧边栏按钮用于日常，本插件负责状态管理与数据展示。
+
+---
+
+#### ⭐ 重启时自动清理（推荐用法）
+
+**这是最省事的方式：不用手动退出，不用双击 `.bat`。**
+
+```text
+面板点「重启 DSH」
+   ↓
+重启助手（WMI 独立进程，活在 DSH 之外）
+   ↓
+① 优雅关闭 DSH
+② 等进程退出 + 等端口释放
+   ↓
+   ┌─────────────────────────────────────┐
+   │ ⭐ 空窗期：Chromium 对 Cookies 的锁  │
+   │    已经释放 → 安全清理 dsh-auth-*    │
+   │    （失败绝不阻断重启）              │
+   └─────────────────────────────────────┘
+   ↓
+③ 启动新 DSH
+   ↓
+用户感知：DSH 重启了一次，Cookie 已清干净
+```
+
+**为什么这个时机是唯一的：**
+
+```text
+DSH 活着  → Chromium 独占 Cookies 库 → 改不了
+DSH 已死  → 锁释放 → 可以改
+   ↓
+重启恰好包含「已死未启」的窗口
+   ↓
+所以「重启」和「清理」天然可以合并
+```
+
+**实现位置：**
+
+```js
+// lib/relaunch-helper.cjs
+// 端口确认释放之后、launch() 之前
+if (config.cookies !== undefined && config.cookies !== null) {
+  const r = cleanAuthCookies(config.cookies)   // 备份 → 删除 → 留标记
+  log(r.removed > 0
+    ? `cookie cleanup removed ${r.removed} dsh-auth-*`
+    : 'cookie cleanup: nothing to remove')
+}
+```
+
+**清理动作（和 CLI 完全一致）：**
+
+```text
+① 备份 Cookies → <DSH_HOME>/restart-helper/cookie-backups/<时间戳>/
+② DELETE ... WHERE host_key IN ('127.0.0.1','localhost')
+                AND name LIKE 'dsh-auth-%'
+③ 清 0 字节 Cookies-journal
+④ 写 cookie-cleanup.json 标记
+   → 下次 Host 启动时据此建立「Cookie 基线」，供面板估算
+```
+
+**安全性：**
+
+| 风险 | 处理 |
+|---|---|
+| 清理逻辑出错 | 失败只写日志，**不阻断重启** |
+| 删错数据 | 先 `copyFileSync` 备份，备份失败就中止 |
+| 删其他站点 cookie | `host_key` 限定本机 + `name` 限定 `dsh-auth-` |
+| 找不到路径 | `buildCookiesCleanup()` 返回 null，跳过清理 |
+| dryRun 模式 | 助手在 dryRun 分支就退出，不会清理 |
+
+**实测（提取 helper 的真实函数跑）：**
+
+```text
+清理前 dsh-auth-*:  71
+调用 cleanAuthCookies
+  → {"removed":71,"leftover":0,"backupPath":"...\\backup\\Cookies"}
+清理后 dsh-auth-*:  0
+备份存在: true（内含 71 个可回读）
+标记文件: {"at":"...","removed":71,"source":"relaunch-helper"}
+journal 已删: true
+幂等第二次: removed: 0
+边界 dbPath 不存在: {"skipped":"cookies db not found"}
+边界 cfg=null: {"skipped":"no config"}
+```
+
+---
+
+#### 新增「清除旧Cookies.bat」
+
+模块六现在有两个脚本：
+
+| 脚本 | 用途 |
+|---|---|
+| `还原DSH配置.bat` | 还原配置 + 运行时状态 |
+| **`清除旧Cookies.bat`** | **清理累积的认证 Cookie** |
+
+**为什么单独一个 `.bat`，而不是塞进现有的？**
+
+```text
+两个动作的语义完全不同：
+  · 还原配置  → 会改动 5 个文件 + 状态库
+  · 清 Cookie → 只删 cookie，不动配置
+混在一起，用户没法「只清 cookie 不还原配置」
+```
+
+`.bat` 的特性：
+
+- 纯 ASCII（cmd.exe 用 OEM 代码页解析）
+- 5 级 node.exe 探测（和还原脚本一致）
+- 自动找 DSH_HOME（不硬编码盘符）
+- **运行前检测 DSH 是否在跑**，在跑就明确提示先退出
+- 清理前自动备份
+- 输出里明确说明「账号不受影响」
+
+#### 安全性说明
+
+这三件事必须说清楚：
+
+**① Cookie 里没有账号信息**
+
+解码真实 payload：
+
+```json
+{"version":1,"authority":"127.0.0.1:53975","issuedAt":1792629835700,"expiresAt":1795221835700}
+```
+
+**只有地址和时间戳。没有 user id、没有 token、没有邮箱。**
+
+**② 账号在 `.credentials.yaml`，不受影响**
+
+```yaml
+records:
+  deepseek-account-platform/default:
+    payload: { token, issuer }      ← 真正的登录态
+  client-connection/browser-session:
+    payload: { secret }             ← cookie 签名密钥
+```
+
+**③ 旧 cookie 技术上永远不会再被使用**
+
+```text
+旧 cookie 的 authority = 127.0.0.1:53975
+下次启动端口        = 例如 61023
+cookie 名 = sha256("127.0.0.1:61023") ≠ 旧名字
+   ↓
+即使保留也匹配不上，只会继续撑大请求头
+```
+
+而且启动握手不依赖旧 cookie：
+
+```js
+start: async () => {
+    const ready = await host.start();
+    hostCookie = await authenticateWebHost(ready.url);  // 用 URL 里的 token 换新 cookie
+```
+
+`authenticateWebHost` 用的是 Node 原生 `fetch`（不读 cookie jar），
+只依赖 URL 查询串里的 `token`。
+
+**实测闭环（2026-10-26 事故现场）：**
+
+```text
+before: 71 个
+clean:  0 个
+启动:   一次成功，9 个进程，无新增崩溃日志
+账号:   未要求重新登录
+```
+
+---
+
+#### ⭐ 体检出问题 → 右下角弹窗提示（2026-10-29 新增）
+
+**用户需求：**
+
+> 「Our Free Model 插件有一个功能很值得学习，就是有新版本推送后，它会在 DSH 界面右下角发送消息提示有新版本可更新，这个弹窗功能很好，我们的 FK 回滚插件也要学习，当体检出问题时，需要提示用户体检出问题」
+
+##### 从 OFM 学到的关键点
+
+**OFM 的 toast 为什么能「在 DSH 任意页面」都看到？**
+
+```text
+它的面板 UI 是挂在【设置页】的 —— 那个组件只在用户打开设置时才存在
+   ↓
+但「有新版本」这件事需要在任何页面都能提示
+   ↓
+所以它没用 React，而是【原生 DOM + document.body】
+   ↓
+document.body 永远存在，跟 slots 的挂载树无关
+```
+
+**FK 照抄了这个思路。**
+
+##### 实现要点
+
+**① 原生 DOM，不用 React**
+
+```js
+function toastHost() {
+  let host = document.querySelector('.fkr-toasts')
+  if (host === null) {
+    host = document.createElement('div')
+    host.className = 'fkr-toasts'
+    document.body.appendChild(host)     // ← 挂 body，不是挂设置页
+  }
+  return host
+}
+```
+
+**② 右下角定位（和 OFM 同款坐标）**
+
+```css
+.fkr-toasts{position:fixed;right:18px;bottom:18px;z-index:1200;...}
+.fkr-toast::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;...}
+.fkr-toast.warn::before{background:...warning...}
+.fkr-toast.urgent::before{background:...error...}
+```
+
+**左侧 3px 色条区分等级，右上角 ✕ 手动关闭，最多同时 4 条。**
+
+**③ 三个接入点**
+
+| 时机 | 行为 |
+|---|---|
+| **DSH 启动后 1.5 秒** | 主动查 `/info` → 有问题就弹（**不用打开设置页**） |
+| 打开设置页刷新 | 同步检查，同一会话已提示过就不再弹 |
+| 手动点「刷新」 | 同上 |
+
+**为什么启动时延迟 1.5 秒：**
+
+```text
+apply() 发生在树挂载期间
+   ↓
+此刻 Host 的 http 端点可能还没注册完
+   ↓
+太早请求会 404 / 连接失败
+   ↓
+等 1.5 秒（OFM 用的也是 1.2 秒这个量级）
+```
+
+**④ 去重：同一组问题只弹一次**
+
+```js
+const NOTIFY_DEDUP_KEY = 'fkr.lastHealthNotify'
+
+function healthFingerprint(report) {
+  // 把所有问题的 code + package/entryId 排序拼起来
+  const parts = probs.map(x => x.code + '|' + (x.package || x.entryId || '')).sort()
+  return 'f' + fatalCount + '::' + parts.join(',')
+}
+```
+
+**用 `sessionStorage` 存指纹 —— 刷新页面不重复弹，但**问题变了会重新弹**。**
+
+**⑤ 只有 fatal / error 才打扰**
+
+```text
+fatal  → 🔴 urgent 色条，留 20 秒
+error  → ⚠️ warn 色条，留 12 秒
+warn   → 不主动弹（留给用户自己看面板）
+```
+
+**⑥ 弹窗内容：取最重要的 3 条**
+
+```text
+🔴 package「surfcore」被 2 个不同的 loader 条目指向：…
+🔴 bad 声明了 dsh.client，但 exports 里没有 "./client"…
+…还有 2 项
+```
+
+**⑦ 「查看」按钮**
+
+- 在设置页里 → 切到体检页
+- 在其它页面（启动时弹的）→ 再弹一条小提示告诉他去哪看
+
+**⑧ 安全兜底**
+
+```js
+function showToast(o) {
+  try { ... } catch { /* 弹窗不能拖垮调用方 */ }
+  return undefined
+}
+```
+
+**整个 toast 系统任何异常都不会冒泡 —— 弹窗失败不能影响 DSH 本身。**
+
+##### 「测试弹窗」按钮
+
+**体检那一行右侧有一个【测试弹窗】按钮：**
+
+```text
+【体检】 ✅ 一切正常   [测试弹窗]
+```
+
+**连续点击会循环演示三种形态，方便一眼确认样式对不对：**
+
+| 第几次点 | 形态 | 色条 | 停留 | 按钮 |
+|---|---|---|---|---|
+| 第 1 次 | 测试：普通提示 | 蓝色 | 10 秒 | 无 |
+| 第 2 次 | 测试：警告（2 个问题） | 橙色 | 12 秒 | 知道了 |
+| 第 3 次 | 测试：致命问题（1 个） | 红色 | 20 秒 | 知道了 / 再来一条 |
+| 第 4 次 | 回到第 1 态，如此循环 | | | |
+
+**为什么需要这个按钮：**
+
+```text
+右下角弹窗只在「真的有问题」时出现
+   ↓
+用户装了新版本，想确认这个功能能不能用
+   ↓
+但当前配置是健康的 → 没法主动触发
+   ↓
+有了测试按钮，随时能看效果
+```
+
+**「再来一条」的行为：**
+
+```text
+点它会【先关掉当前这条】再弹一条新的
+   ↓
+所以窗口里始终只有一条（不是越点越多）
+```
+
+**实测（9 项断言）：**
+
+```text
+连续点击 4 次的三态循环            4 项 ✅（class + title 都对）
+info 态无按钮                     1 项 ✅
+warn 态有「知道了」                 1 项 ✅
+urgent 态两个按钮                  2 项 ✅
+连点 10 次仍只有 4 条（上限生效）    1 项 ✅
+```
+
+---
+
+##### 实测（22 项断言全通过）
+
+```text
+① showToast 渲染          6 项 ✅（元素/class/标题/正文/关闭键/挂载）
+② 上限 4 条               1 项 ✅（弹 8 条后只剩 4 条）
+③ 无 tone / 无 body       2 项 ✅
+④ 指纹去重                2 项 ✅（同内容一致 / 不同内容不同）
+⑤ 摘要生成                1 项 ✅
+⑥ 弹窗 + 去重             5 项 ✅（首次弹 / 1 条 / urgent 色 / 二次不弹 / 条数不变）
+⑦ 不打扰                  2 项 ✅（只有 warn 不弹 / 全正常不弹）
+⑧ error 级                2 项 ✅（会弹 / 用 warn 色）
+⑨ 异常输入                1 项 ✅（6 种坏输入不崩）
+                          ─────
+                          22 通过 / 0 失败
+```
+
+---
+
+#### ⭐ 检测到问题 → 一键回滚（2026-10-29 新增）
+
+**上面那个检查报 fatal 之后，用户该做什么？**
+
+**2026-10-29 用户的原话：**
+
+> 「改为安装后吧，至少能保证，安装后做一次体检，能检测到问题可以直接回滚」
+
+**所以面板的体检行现在长这样：**
+
+```text
+【体检】 ❌ 2 个致命问题   [ 查看 ] [ 回滚 ]
+```
+
+**点「回滚」直接打开回滚确认框，目标已经选好了。**
+
+##### 回滚到哪里
+
+**复用 `pickLastGood()`（`restore --last-good` 用的同一套逻辑）：**
+
+```text
+① 今天的 daily 快照        ← 当天首次启动的状态 = 装插件之前
+② 最近一天的 daily 快照
+③ verified-strong / verified / static-ok（健康降级链兜底）
+   全部排除 broken
+```
+
+**实测（本机）：**
+
+```text
+id:      20261029-072921-574
+name:    每日快照 2026-10-29
+type:    daily
+health:  ok
+created: 2026/10/29 07:29:21
+level:   today-daily
+reason:  今天的启动快照（2026-10-29）
+```
+
+##### 完整流程
+
+```text
+今天启动 DSH
+   ↓
+自动建 daily 快照 ← 这一刻就是「装插件之前」的状态
+   ↓
+装第三方插件
+   ↓
+插件管理事件钩子自动触发（不用重启）：
+  存快照（auto-plugin-change）+ 跑一次体检
+   ↓
+🔴 FATAL duplicate-client-source
+   ↓
+面板【体检】❌ 2 个致命问题  [查看] [回滚]
+                                    ↑ 点这个
+   ↓
+回滚确认框（目标已选好：每日快照 2026-10-29）
+   ↓
+确认 → 配置恢复到装之前 → 重启 → 正常
+```
+
+**不用自己翻快照列表，不用记哪个是装之前的。**
+
+##### 为什么不做「装之前扫描」
+
+**2026-10-29 曾实现过 `scan-plugin` 命令（扫描待安装插件包），后来又删掉了。**
+
+**原因：不准确。**
+
+| 问题 | 说明 |
+|---|---|
+| 装前是「模拟解析」 | name 归属哪个 package 全靠推测 |
+| 无法覆盖多插件交叉 | 插件 A 和插件 B 的 patch 合并后可能冲突 |
+| pnpm install 会改变解析 | 装之前得到的结论可能和装之后不同 |
+
+**而装后体检读的是【真实已装状态】，且检查项已经齐全：**
+
+```text
+client-export-missing        声明 dsh.client 但无 exports["./client"]
+client-file-missing          exports 指向的文件不存在
+client-loader-id-mismatch    client.js 的模块 id 与包名不一致
+duplicate-client-source      同包多源（2026-10-28 事故主因）
+engines-exact-mismatch       engines.dsh 精确锁定到别的版本
+```
+
+**所以：装前扫描既重复又不准 → 删除，只保留装后体检 + 一键回滚。**
+
+**准确率优先。**
+
+---
+
+#### 新增检查：代理环境变量指向失效代理（2026-11-14 事故）
+
+**这是第一个「不在配置文件里」的故障，也是第一个让 FK 的「体检范围」扩到系统环境的检查。**
+
+##### 事故经过
+
+```text
+所有模型全部无法调用
+  官方 DeepSeek：不可用
+  第三方 provider：ModelScope / AMD / SiliconFlow / Qwen / NVIDIA / 中转站 全都不行
+  界面统一提示：DeepSeek Messages transport failed
+
+用户已经换了模型、换了 provider —— 全都无效。
+```
+
+**根因：**
+
+```text
+用户级环境变量：
+  HTTP_PROXY  = http://127.0.0.1:7897
+  HTTPS_PROXY = http://127.0.0.1:7897
+       ↓
+127.0.0.1:7897 没有任何进程监听（代理软件没启动）
+       ↓
+DSH 0.2.2 新增的全局代理策略模块在启动时读这两个变量，
+把进程内的 undici 全局 dispatcher 换成指向该代理的 ProxyAgent
+       ↓
+代理不可达 → 每一条出站 HTTPS 请求全部失败
+       ↓
+所有 provider 统一报 "DeepSeek Messages transport failed"
+```
+
+##### 为什么这个报错极具误导性
+
+报告里从 asar 挖出了源码：
+
+```js
+} catch (error) {
+  if (error instanceof LlmError) throw error;
+  throw new LlmError('DeepSeek Messages transport failed', 'TRANSPORT', { cause: error });
+}
+```
+
+**结论：**
+
+```text
+任何 provider 的底层网络异常都被统一包装成这一条
+   ↓
+看到它并不代表「官方 DeepSeek 的问题」
+   ↓
+但用户的第一反应一定是「API 挂了」或「密钥失效」
+   ↓
+于是换模型、换 provider、查 .credentials.yaml —— 全是白试
+```
+
+##### FK 为什么原来查不出
+
+**29 个检查项全部围绕「profile 配置文件 + Electron 运行时状态」，完全没有环境变量这一维度。**
+
+##### 为什么回滚 / 重启都救不了
+
+```text
+变量存在注册表 HKCU\Environment
+   ↓
+不在快照范围内（快照只有 5 个配置文件）
+   ↓
+也不会随 DSH 重启而改变
+   ↓
+所以 restore 无效、重启无效
+```
+
+##### 新增检查项 `proxy-env-dead`（fatal）
+
+**实现要点：**
+
+```js
+const PROXY_ENV_KEYS = [
+  'HTTP_PROXY', 'http_proxy',
+  'HTTPS_PROXY', 'https_proxy',
+  'ALL_PROXY', 'all_proxy',      // 大小写都认
+]
+```
+
+**探活方式：同步 `netstat`（不是异步 socket）**
+
+```text
+为什么必须同步：
+  runCheck() 是同步函数，有 12 处调用点
+  （entry.js 7 处 + dsh-rollback.mjs 5 处）
+  为一个端口探测把它全改成 async —— 改动面太大，风险太高
+
+netstat -ano -p TCP 一次约 30ms，完全够用
+```
+
+**保守判据（避免误报）：**
+
+```text
+① 只探 127.0.0.1 / localhost / ::1
+   —— 远程代理探不通可能只是防火墙，不该报
+② 端口能连上 → 不报
+③ 变量没设置 → 什么都不做
+```
+
+##### 报错与指引
+
+```text
+❌ HTTP_PROXY / http_proxy / HTTPS_PROXY / https_proxy = 127.0.0.1:7897
+   —— 这个代理端口【没有进程在监听】。
+   DSH 0.2.2 起会在启动时读取代理环境变量，把全局 HTTP dispatcher
+   换成指向该代理的 ProxyAgent，于是每一条出站请求全部失败：
+   所有模型（官方 + 全部第三方）统一报
+   "DeepSeek Messages transport failed"，
+   换模型、换 provider、查密钥全都无效。
+
+   💡 要么启动代理软件，要么删掉变量后【完全重启 DSH】：
+      [Environment]::SetEnvironmentVariable("HTTP_PROXY",$null,"User");
+      [Environment]::SetEnvironmentVariable("HTTPS_PROXY",$null,"User")
+      ⚠️ 重启 / 回滚快照都治不了这个 —— 变量存在注册表里，不在快照范围内。
+```
+
+**体检总览那一行也改了（避免误导）：**
+
+```text
+改前：⚠️ 有致命问题 —— DSH 很可能起不来，建议尽快回滚到健康快照
+改后：⚠️ 有致命问题 —— 其中有的【回滚救不了】，请看下方专项指引
+```
+
+**并且专门给一段专项指引：**
+
+```text
+👉 代理环境变量指向失效代理 —— 这个问题【回滚/重启都救不了】
+
+   原因：变量存在【注册表】（HKCU\Environment），
+         既不在快照范围内，也不会随 DSH 重启而改变。
+
+   它为什么让所有模型都挂：
+     DSH 0.2.2 起会在启动时读取 HTTP_PROXY / HTTPS_PROXY，
+     把全局 HTTP dispatcher 换成指向该代理的 ProxyAgent。
+     代理没开 → 每一条出站请求全部失败 →
+     所有 provider 统一报 "DeepSeek Messages transport failed"。
+     这个报错完全不指向真因，换模型、换 provider、查密钥都是白试。
+
+   两个选择（任选一个，然后【完全重启 DSH】）：
+     A. 启动代理软件（如果确实需要代理）
+     B. 删掉这两个用户级变量：
+          [Environment]::SetEnvironmentVariable("HTTP_PROXY",$null,"User")
+          [Environment]::SetEnvironmentVariable("HTTPS_PROXY",$null,"User")
+```
+
+##### 实测（21 项单元断言 + 整链路）
+
+```text
+单元测试（21/21）：
+  ① isPortListeningSync    7897 无监听 ✅ / 58504 有监听 ✅
+  ② parseProxyValue        7 种输入全部正确（含 socks5://、无 scheme、空串、坏 URL）
+  ③ 空环境                 不报警 ✅
+  ④ 事故原样（7897 死）     报 1 条，code=proxy-env-dead，fatal ✅
+  ⑤ 代理活着               不报警 ✅
+  ⑥ 远程代理               不探不报 ✅
+  ⑦ 大小写 6 种变体         全部报出 ✅
+
+整链路：
+  干净环境            exit=0，✅ 一切正常
+  事故环境            exit=4，✅ 检出 proxy-env-dead
+  verdict 文案        ✅ 不再说「建议回滚」
+  专项指引            ✅ 有
+  修复命令            ✅ 给出
+  不归入「可还原快照」  ✅
+```
+
+##### ⭐ 自动修复：`proxy` 命令（2026-11-14 新增）
+
+**用户 2026-11-14 的追问：**
+
+> 「所以现在针对这个事故是否可以修复了？」
+
+**「发现」和「修」是两件事。上面那节只做了发现，这里补上真动手。**
+
+**三个动作：**
+
+```bash
+# 诊断（默认）
+node dsh-rollback.mjs proxy
+
+# 修复：删掉指向失效代理的变量（先备份）
+node dsh-rollback.mjs proxy --fix --dry-run    # 预演
+node dsh-rollback.mjs proxy --fix              # 真删
+
+# 反悔：从备份恢复
+node dsh-rollback.mjs proxy --restore
+```
+
+**诊断输出：**
+
+```text
+  代理环境变量诊断
+  --------------------------------------------------------------
+  用户级（注册表 HKCU\Environment）代理变量：
+
+    HTTP_PROXY / http_proxy / HTTPS_PROXY / https_proxy
+      值：http://127.0.0.1:7897
+      状态：❌ 代理没有运行 ← 这就是故障原因
+
+  ⚠️ 有代理变量指向没有运行的端口。
+     这会让 DSH 0.2.2 的所有模型统一报 "DeepSeek Messages transport failed"。
+
+     两个选择：
+       A. 启动代理软件（如果确实需要代理）
+       B. 删掉这些变量：dsh-rollback proxy --fix
+
+     ⓘ 加 --dry-run 可以先看会删什么，不动手。
+```
+
+**修复输出：**
+
+```text
+  已删除：
+    ✓ HTTP_PROXY（原值：http://127.0.0.1:7897）
+    ✓ HTTPS_PROXY（原值：http://127.0.0.1:7897）
+
+  备份（原值已存，可反悔）：
+    <DSH_HOME>\proxy-env-backup.json
+
+  ⚠️ 必须【完全退出 DSH 再启动】才会生效 ——
+     环境变量在进程启动时读取，已运行的进程不会重新读。
+
+  反悔：dsh-rollback proxy --restore
+```
+
+**安全设计：**
+
+| 项 | 做法 |
+|---|---|
+| **只删指定键** | 不做「全删」这种危险默认；只删诊断出来是死的那几个 |
+| **先备份** | 原值写进 `proxy-env-backup.json`；写备份失败就不删 |
+| **可预演** | `--dry-run` 只显示不动手 |
+| **可反悔** | `--restore` 从备份恢复 |
+| **删后复查** | 再读一遍注册表，确认真的没了 |
+| **只杀死的** | 代理在运行（端口有监听）→ 一个都不删 |
+
+**⚠️ 为什么读注册表而不是 process.env：**
+
+```text
+process.env 是 DSH 启动时继承的快照
+   ↓
+用户改完变量后，DSH 进程里还是旧值
+   ↓
+判断「注册表里有什么」必须直接读 HKCU\Environment
+   ↓
+实现：powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('X','User')"
+```
+
+**实测（8 步端到端，全过）：**
+
+```text
+① 无变量        exit=0  ✅「当前用户没有任何代理环境变量」
+② 事故环境      exit=4  ✅ 准确报出「代理没有运行 ← 这就是故障原因」
+③ --fix --dry-run       ✅ 列出将删 4 个（大小写各 2 个）；磁盘未变
+④ --fix 真就干  exit=0  ✅ 删 4 个 + 写备份
+⑤ 注册表验证             ✅ HTTP_PROXY / HTTPS_PROXY 都变空
+⑥ 备份内容              ✅ {"HTTP_PROXY":"http://127.0.0.1:7897", ...}
+⑦ 修复后再诊断  exit=0  ✅「干净状态」
+⑧ --restore     exit=0  ✅ 4 个全部恢复，值正确
+```
+
+**⚠️ 测试完后已确认你的真实环境未被污染（注册表零 PROXY 变量）。**
+
+**这一条补充了 FK 的能力边界：**
+
+```text
+restore                配置文件被改坏        → 快照内
+core                   核心包副本            → node_modules 层
+estate --clean-cookies Cookie 累积            → Chromium 状态层
+estate --reset         运行时状态库损坏      → Chromium 状态层
+proxy --fix            代理环境变量           → 注册表层 ← 新增
+```
+
+**现在 FK 能自己修的故障，从 4 类扩到 5 类。**
+
+---
+
+##### 这条检查的边界
+
+**它只查「本机代理端口是否在监听」，不查：**
+
+```text
+· 远程代理是否可用（防火墙会挡住探测，探不通不代表失效）
+· 代理是否需要认证
+· NO_PROXY 的排除规则是否正确
+· 系统代理开关（ProxyEnable）与这些变量的关系
+```
+
+**理由：只报「能确定是故障」的情形，宁可少报也不误报。**
+
+---
+
+#### 新增检查：内核核心包副本（2026-11-04 事故）
+
+**这是第二个「装插件后 DSH 就废了」的问题，而且比 surfcore 那个更隐蔽 ——
+FK 原来报「一切正常」，回滚也无用。**
+
+##### 事故经过
+
+装了 `dsh-unrestricted` 之后：
+
+```text
+新建会话失败
+恢复已有会话失败
+所有 Agent 预设（standard / ptc / minimal / cordis / fk）全部 broken
+前端弹：resume failed ... prompt section "deployment:persona-prefix" is already registered
+```
+
+**根因不是插件业务逻辑，是它的安装过程把 6 个官方核心包装进了 profile：**
+
+```text
+@deepseek-ai/cordis              4.0.5
+@deepseek-ai/cosmokit            1.8.6
+@deepseek-ai/dsh-llm             0.2.1-rc.5
+@deepseek-ai/dsh-scope           0.2.1-rc.5
+@deepseek-ai/dsh-system-prompt   0.2.1-rc.5
+@deepseek-ai/schemastery         3.18.5
+```
+
+**为什么两套实例会炸：**
+
+```text
+dsh-scope        负责 Agent / 预设的作用域标识（基于【对象身份】，用 === 判）
+dsh-system-prompt 负责提示词分层（全局层 + 每个 agent 的 scoped 层）
+cordis           负责服务与上下文
+       ↓
+两套实例 = 两个不同的对象 → === 判不出「同一个 scope」
+       ↓
+插件注册提示词时不被识别为「当前 agent 作用域」
+       ↓
+落到【全局层】，而全局层已有同名段落
+       ↓
+PromptLayer 的 NamedEntries 抛 "prompt section is already registered"
+       ↓
+激活审计失败 → 预设标记 broken → 会话无法创建/恢复
+```
+
+**报告里的隔离实验（决定性证据）：**
+
+| 测试配置 | 结果 |
+|---|---|
+| 官方两个 bundle，无 node_modules | 所有预设正常 |
+| 官方两个 bundle + **仅放入 @deepseek-ai 核心副本** | **所有预设损坏** |
+| 官方两个 bundle + 完整第三方 node_modules | 所有预设损坏 |
+| 官方两个 bundle + 完整第三方，但**移出核心副本** | 所有预设正常 |
+
+##### FK 为什么原来查不出（三处都漏）
+
+```js
+// ① listDshPackages 只扫 node_modules 顶层
+for (const name of readdirSync(nm)) {
+  if (name.startsWith('.')) continue
+  const pkgPath = join(nm, name, 'package.json')   // ← @deepseek-ai 是目录，没有 package.json
+  if (pkg?.dsh) out.push(name)                     // ← 且要求有 dsh 字段
+}
+
+// ② 那 6 个核心包【都没有】dsh 字段
+//    cordis / dsh-llm / dsh-scope / dsh-system-prompt / cosmokit / schemastery
+//    → 即使扫到也会被 if (pkg?.dsh) 过滤掉
+
+// ③ bundle-official-from-asar 把「官方包不在 node_modules」当【正常】
+//    但反过来的情形 —— 官方核心包【在】node_modules —— 没有对应检查
+```
+
+**实测确认：把 4 个核心包副本放进 `node_modules/@deepseek-ai/`，
+`runCheck()` 返回 `overall: ok`、`0 个问题`。**
+
+##### 为什么回滚也救不了
+
+```text
+快照只含 5 个配置文件 + Electron 状态：
+    pnpm-workspace.yaml / compatibility.json / pnpm-lock.yaml /
+    package.json / cordis.patch.yml
+       ↓
+不含 node_modules（设计如此：它本可由 lockfile 重建）
+       ↓
+回滚 = 把这 5 个文件写回去
+       ↓
+那 6 个副本【原样留着】
+       ↓
+必然无效
+```
+
+**最恶心的一点：**
+
+```text
+核心包副本【不在 lockfile 里】
+   ↓
+pnpm install / pnpm prune 都提示 "Already up to date"
+   ↓
+既不重建它，也不清理它
+   ↓
+只能手动移走
+```
+
+##### 新增检查项 `core-package-duplicate`（fatal 级）
+
+**实现 `scanCorePackageCopies()`：**
+
+```js
+const DSH_CORE_SCOPED_PACKAGES = {
+  // 涉及「对象身份 / 作用域」的包 —— 有副本必然导致预设损坏
+  'cordis': 'fatal',
+  'dsh-scope': 'fatal',
+  'dsh-system-prompt': 'fatal',
+  'dsh-llm': 'fatal',
+  // 纯工具库 —— 通常无害，但仍是重复安装的信号
+  'cosmokit': 'warn',
+  'schemastery': 'warn',
+}
+```
+
+**分级理由（2026-11-04 从 asar 源码实测出来的，不是猜的）：**
+
+```text
+判据：这些包有没有用 Symbol.for / globalThis 做【跨实例识别】？
+
+  dsh-scope          Symbol.for = 0   globalThis = 0    → 按对象身份 (===)
+  dsh-system-prompt  Symbol.for = 0   globalThis = 0    → 按对象身份 (===)
+  dsh-llm            Symbol.for = 0   globalThis = 0    → 按对象身份 (===)
+       ↓
+   两份实例 = 两个不同对象 → === 判不出同一个 scope → 致命
+
+  cordis             Symbol.for = 21                    → 跨实例安全
+  cosmokit           Symbol.for = 1   globalThis = 2    → 跨实例安全
+  schemastery        Symbol.for = 2   globalThis = 9    → 跨实例安全
+     （Symbol.for("schemastery") + globalThis.__schemastery_index__）
+       ↓
+   两份实例能认出彼此 → 多一份无害
+```
+
+**⚠️ 这里我犯过一个错，记下来：**
+
+第一版实现把 `cosmokit` / `schemastery` 报成 **warn**，理由是「纯工具库，但仍是重复安装的信号」。
+
+用户看到后问：**「？怎么有警告了？」**
+
+去查 asar 源码才发现：这两个包用 `Symbol.for` 做全局注册表，**跨实例是安全的**。而且用户保留了它们，DSH 启动完全正常、5 个预设全 OK —— **实证明无害**。
+
+所以改成：**这 6 个包里只报 3 个（dsh-scope / dsh-system-prompt / dsh-llm），其余不报警。**
+
+**教训：报「重复安装」不等于报「有害」。只有验证过危害的才该报警。**
+
+**报错原文：**
+
+```text
+❌ profile 的 node_modules/@deepseek-ai/ 里有 3 个 DSH 内核核心包的副本：
+   @deepseek-ai/dsh-llm@0.2.1-rc.5、@deepseek-ai/dsh-scope@0.2.1-rc.5、
+   @deepseek-ai/dsh-system-prompt@0.2.1-rc.5
+   —— 它们会和内核自带的同名包形成【两套模块实例】，
+   导致 dsh-scope / dsh-system-prompt 的作用域判断失效，
+   表现为「所有 Agent 预设同时报 prompt section is already registered」、
+   新建会话与恢复会话全部失败。
+   💡 把 node_modules/@deepseek-ai 下这些目录【移动】到备份处
+      （不要删除，便于排查），然后重启 DSH。
+      ⚠️ 回滚快照救不了这个问题 —— 快照不包含 node_modules。
+```
+
+##### ⭐ 自动修复：`core` 命令（2026-11-04 新增）
+
+**用户 2026-11-04 的追问：**
+
+> 「所以，这个事故报告问题解决不了？」
+
+**不是解决不了 —— 是 FK 当时只会「报告」不会「修」。现在补上了。**
+
+**用法：**
+
+```bash
+# 预演：只显示会移走哪些
+node dsh-rollback.mjs core --dry-run
+
+# 真修复（必须先完全退出 DSH）
+node dsh-rollback.mjs core
+
+# 自定义备份位置
+node dsh-rollback.mjs core --backup-to "D:\某个备份目录"
+```
+
+**它做什么：**
+
+```text
+① 检查 DSH 是否已退出（运行中会拒绝，因为 node_modules 可能被占用）
+② 找出 node_modules/@deepseek-ai/ 下这 3 个致命包：
+     dsh-scope / dsh-system-prompt / dsh-llm
+③ 移动到 <DSH_HOME>/_backup-core-copy-<时间戳>/@deepseek-ai/
+     ⚠️ 移动，不删除 —— 便于排查，也便于反悔
+④ 若 @deepseek-ai 目录空了，一并移走（不留空壳）
+⑤ 输出下一步指引
+```
+
+**⚠️ 只移这 3 个，不动 cosmokit / schemastery：**
+
+```text
+dsh-scope / dsh-system-prompt / dsh-llm   → Symbol.for = 0，按对象身份判 → 必移
+cosmokit / schemastery                    → 有 Symbol.for，跨实例安全 → 保留
+cordis                                    → Symbol.for = 21 → 不改
+```
+
+**实测（6 步全过）：**
+
+```text
+① 修复前 check            命中 core-package-duplicate（fatal）
+② core --dry-run          列出将移走 3 个；磁盘未变 ✅
+③ core 真实执行           移走 3 个，输出备份位置
+④ 修复后磁盘              @deepseek-ai 只剩 cosmokit / schemastery ✅
+                          备份目录含 3 个包 ✅
+⑤ 修复后 check            core-package-duplicate 消失 ✅
+⑥ 幂等再跑                「已经清干净，无需处理」✅
+```
+
+**输出示例：**
+
+```text
+  内核核心包副本隔离
+  --------------------------------------------------------------
+  DSH_HOME : <DSH_HOME>
+  profile  : desktop
+  目标目录 : <DSH_HOME>\profiles\<profile>\node_modules\@deepseek-ai
+
+  已隔离：
+    ✓ @deepseek-ai/dsh-scope
+    ✓ @deepseek-ai/dsh-system-prompt
+    ✓ @deepseek-ai/dsh-llm
+
+  备份位置（移动，不是删除 —— 便于排查和反悔）：
+    <DSH_HOME>\_backup-core-copy-<时间戳>
+
+  ✅ 完成。现在启动 DSH，然后跑一次确认：
+     dsh-rollback check
+
+  ⓘ 为什么要移走这几个包：
+    它们与内核自带的同名包形成两套模块实例，
+    导致 dsh-scope 的作用域判断失效（按对象身份 ===，两份实例认不出彼此）
+    → 所有 Agent 预设报 prompt section is already registered
+    → 新建会话、恢复会话全部失败。
+
+  ⓘ cosmokit / schemastery 不在此列 —— 它们用 Symbol.for 做跨实例识别，
+    多一份无害，可以保留。
+```
+
+**反悔方法：**
+
+```text
+把备份目录里的 @deepseek-ai/<包名> 移回
+profiles/desktop/node_modules/@deepseek-ai/
+```
+
+**实现位置：**
+
+| 文件 | 内容 |
+|---|---|
+| `lib/estate.mjs` | `quarantineCoreCopies()` + `CORE_SCOPED_PACKAGES` |
+| `dsh-rollback.mjs` | `cmdCore()` + 命令注册 + 帮助文本 |
+
+---
+
+##### 体检输出现在会区分「回滚能救 / 救不了」
+
+**这是本次另一个修复 —— 之前用户看到 fatal 就以为回滚能解决，白试一遍。**
+
+```text
+👉 内核核心包副本 —— 这个问题【回滚救不了】
+
+   原因：快照只备份 5 个配置文件 + Electron 状态，不含 node_modules。
+        （设计如此：它本可由 lockfile 重建。但核心包副本不在 lockfile 里，
+         pnpm 既不重建也不清理它 —— 所以只能手动移走。）
+
+   正确做法（移动，不要删除，便于排查）：
+     1. 完全退出 DSH（关窗口 + 确认托盘图标消失）
+     2. 新建备份目录：
+        mkdir "<DSH_HOME>\_backup-core-copy-<日期>"
+     3. 把这些目录移进去：
+        <DSH_HOME>\profiles\<profile>\node_modules\@deepseek-ai\cordis
+        <DSH_HOME>\profiles\<profile>\node_modules\@deepseek-ai\dsh-llm
+        <DSH_HOME>\profiles\<profile>\node_modules\@deepseek-ai\dsh-scope
+        <DSH_HOME>\profiles\<profile>\node_modules\@deepseek-ai\dsh-system-prompt
+     4. 启动 DSH，再跑一次 dsh-rollback check 确认
+
+   ⓘ cosmokit / schemastery 是纯工具库，有些插件依赖它们，
+     可以保留（只报警告，不致命）。
+
+👉 其余问题 —— 可尝试还原快照：
+     dsh-rollback list                # 看有哪些快照
+     dsh-rollback restore <快照id>    # 配置 + 状态一起还原
+```
+
+##### 实测（9 项断言全通过）
+
+```text
+① 事故原样（4 个作用域包副本）     ✅ 命中 fatal，overall=fatal
+② 只有工具库副本（cosmokit+schemastery） ✅ 命中 warn，无 fatal（不误报）
+③ 干净环境                        ✅ 零报警
+④ 混合（4 致命 + 2 工具）          ✅ 两个都命中
+```
+
+##### 这条检查的边界
+
+**它只查 `@deepseek-ai/` 作用域下的内核核心包，不查：**
+
+```text
+· 任意第三方包的重复实例（那是 pnpm 的职责）
+· 插件自己的多份副本（没有已知危害）
+· lockfile 与实际 node_modules 的偏差（那是 pnpm install 的活）
+```
+
+**理由：只报「已知会导致 DSH 失效」的情形，避免误报。**
+
+---
+
+#### 新增检查：同一插件被登记两次（2026-10-28 事故）
+
+**这是一类「装完插件、重启就起不来」的问题，而且报错信息完全不直观。**
+
+##### 事故经过
+
+朋友的 DSH（`0.2.1-rc.3`）装了第三方插件 **surfcore**，重启后应用直接退出：
+
+```text
+DesktopHostFatalError: dsh: startup failed: 1 required plugin did not activate
+
+Failed plugins (1):
+  modules (required)
+    Package: @deepseek-ai/dsh-client-modules
+    AggregateError: client-modules: 1 client package failed to compose:
+      other failures:
+        - client-modules: package surfcore resolves from multiple active Loader sources:
+          "surfcore" from file:///D:/DSH_Data/profiles/desktop/,
+          "file:///D:/DSH_Data/profiles/desktop/node_modules/surfcore/lib/qq-mode.js"
+          from file:///D:/DSH_Data/profiles/desktop/; remove one entry
+```
+
+朋友的评价：
+
+> 「直接导致打不开 DSH，幸好可以用你的回滚」
+
+##### 病因
+
+surfcore 自己的 `cordis.patch.yml` 里插入了两行：
+
+```yaml
+- id: surfcore
+  name: surfcore          # 相对插件目录 → node_modules/surfcore/package.json
+- id: qq-mode
+  name: ./lib/qq-mode.js  # 相对插件目录 → node_modules/surfcore/lib/qq-mode.js
+                          #              → 向上找 → node_modules/surfcore/package.json
+```
+
+**看起来是两个不同的东西，但两行的 `name` 最终都解析到同一个 `package.json`。**
+
+而那个 manifest 声明了 `dsh.client`，于是 DSH 认为「同一个 package 出现了两个 client 源」——
+它不知道该用哪一个，直接抛错，整个应用起不来。
+
+##### DSH 的精确规则（从源码挖出）
+
+`app.asar` → `@deepseek-ai/dsh-client-modules/lib/index.js`：
+
+```js
+resolveMeta(loaderName, baseUrl) {
+    const sourceKey = this.sourceKey(loaderName, baseUrl);
+    const located = this.locatePkgJson(loaderName, baseUrl);
+    if (located === void 0) return null;                    // 解析不到 → 跳过
+    const { packageName, path: pkgPath } = located;
+    const decl = parseDshClient(packageName, pkg.dsh?.client);
+    if (decl === void 0 || decl.platform !== "web") return null;  // 不算 client 源
+    return { packageName, meta };
+}
+
+reconcilePackage(packageName) {
+    const sources = [];
+    for (const source of this.sources.values())
+        if (source.packageName === packageName) sources.push(source);
+    if (sources.length > 1) {                                // ← 这里抛错
+        throw new Error(`client-modules: package ${packageName} resolves from
+            multiple active Loader sources: ...; remove one entry`);
+    }
+}
+```
+
+所以判定条件是三条同时成立：
+
+```text
+① 同一个 packageName（manifest 解析出的 name）
+② 出现 ≥2 个【不同】的 loader name（sourceKey = loaderName + baseUrl）
+③ 该 manifest 声明了 dsh.client 且 platform === 'web'
+   ↓
+DSH 启动必失败
+```
+
+**注意：同一个 name 重复出现**不算冲突**（`sourceKey` 相同，后者覆盖前者）。
+
+本机实测印证：`cordis.patch.yml` 里 `dsh-boot-animation` 出现 **2 次**，
+且它有 `dsh.client`，但 DSH 正常启动 —— 因为两行 `name` 完全相同。
+
+##### 新增检查项 `duplicate-client-source`（fatal 级）
+
+```js
+add('fatal', 'duplicate-client-source',
+  `package「${packageName}」被 ${uniqueNames.length} 个不同的 loader 条目指向：${detail} —— `
+  + 'DSH 启动时会在 dsh-client-modules 里抛「resolves from multiple active Loader sources」，'
+  + '整个应用起不来。删掉其中一行即可。', ...)
+```
+
+**实现在 `lib/check.mjs`：**
+
+| 函数 | 作用 |
+|---|---|
+| `parseLoaderRows(text)` | 从 patch 文本提取 `{ id, name, disabled, line }` |
+| `locatePkgForLoaderName(name, baseDir, home)` | 把 name 解析成它归属的 `package.json` |
+| `scanClientSourceConflicts(...)` | 遍历所有 patch 源，找出同包多源 |
+
+**⚠️ 必须遍历所有 patch 源，不能只看 profile 的：**
+
+```text
+profile 的 cordis.patch.yml     → baseUrl = profiles/desktop/
+每个 bundle 的 cordis.patch.yml → baseUrl = 插件目录   ← surfcore 就属于这种
+```
+
+第一版只查了 profile，测试时 `./lib/qq-mode.js` 解析返回 null 才发现这一点。
+修正后遍历 profile + 每个 bundle。
+
+##### 实测：三个场景
+
+**① surfcore 原样（应命中）**
+
+```text
+🔴 [FATAL] duplicate-client-source
+  package「surfcore」被 2 个不同的 loader 条目指向：
+  「surfcore」（id: surfcore，surfcore 的 cordis.patch.yml 第 2 行）、
+  「./lib/qq-mode.js」（id: qq-mode，surfcore 的 cordis.patch.yml 第 4 行）
+  —— DSH 启动时会在 dsh-client-modules 里抛
+  「resolves from multiple active Loader sources」，整个应用起不来。
+  删掉其中一行即可。
+```
+
+**② 正常插件（只有一行）→ 0 个 issue** ✅ 不误报
+
+**③ 两行但 package 无 `dsh.client` → 0 个 issue** ✅ 正确（DSH 也会跳过）
+
+**④ 本机真实配置 → 0 个 issue** ✅ 不误报
+
+##### 为什么这个检查有用
+
+```text
+装第三方插件
+   ↓（不用重启！）
+本插件的「插件管理事件」钩子自动触发：
+  存快照（标记 auto-plugin-change）+ 体检一次
+   ↓
+🔴 FATAL：duplicate-client-source
+   ↓
+用户看到 → 删掉一行 → 再重启
+   ↓
+根本不会经历「起不来 + 崩溃弹窗 + 配置被清空」
+```
+
+##### 边界说明（这个检查不做什么）
+
+| 问题 | 归不归本插件 |
+|---|---|
+| 同一插件被登记两次 | ✅ **归** —— 是 DSH 配置层问题，会导致起不来 |
+| 插件绕过 `DSH_HOME`，在 C 盘建影子目录 | ❌ 不归 —— 插件运行行为，不威胁启动 |
+| 插件源码硬编码 `~/.dsh` | ❌ 不归 —— 插件内部实现，不是配置 |
+| 插件自动开会话污染工作区 | ❌ 不归 —— 插件业务行为 |
+| 插件体积异常 | ❌ 不归 —— 不是判断标准 |
+
+**本插件的职责严格限定为：「让 DSH 起不来」的配置问题 + 出事后的配置恢复。**
+**插件质量审计不属于这里。**
+
+---
+
+#### 实测快照：面板唯一可信的数据来源
+
+**问题：** DSH 运行时 Chromium 以独占模式持有 Cookie 文件，插件读不到内容。
+
+实测七种方式全部失败：
+
+| 方式 | 结果 |
+|---|---|
+| `fs.readFileSync` | ❌ `EBUSY` |
+| `fs.openSync('r') + readSync` | ❌ `EBUSY` |
+| `fs.createReadStream` | ❌ `EBUSY` |
+| `new DatabaseSync(path, {readOnly:true})` | ❌ `unable to open database file` |
+| `mode=ro&immutable=1` | ❌ 同上 |
+| CDP `Network.getCookies` | ❌ `unsupported Network method` |
+| CDP `Storage.getCookies` | ❌ `Method not found` |
+
+**所以面板上的「约 N 个」只能是推算值。**
+
+**真正能拿到真实值的只有一处：重启窗口。**
+
+```text
+DSH 运行中 → Chromium 独占 → 读不到
+DSH 已退出 → 锁释放     → 能读
+   ↓
+「重启」= 关闭 + 空窗期 + 启动
+   ↓
+空窗期就是唯一的读取时机
+```
+
+**重启助手（WMI 独立进程，活在 DSH 之外）就在那个窗口里，所以它不只清理，还记录实测快照。**
+
+#### 实测快照记录了什么
+
+```json
+{
+  "at": "2026-10-27T09:50:00.000Z",
+  "observed": 4,                 // 真实 dsh-auth-* 数量
+  "total": 4,                    // 库内 cookie 总数
+  "removed": 4,                  // 这次清掉几个
+  "headerBytes": 912,            // 请求头占用字节
+  "headerBudget": 15984,         // Node maxHeaderSize 16384 - 其他头 400
+  "ratio": 0.057,
+  "ports": [53975, 64245, 56306, 63890],
+  "oldest": 1792629835700,       // 最早签发时间
+  "newest": 1793055716000,       // 最晚签发时间
+  "backupPath": "...",
+  "source": "relaunch-helper",
+  "triggeredBy": "dsh-fk-rollback (面板「重启 DSH」)"
+}
+```
+
+#### 无条件写入（2026-10-27 修复）
+
+**原实现有个缺陷：**
+
+```js
+// 只有清掉了东西，才写记录
+if (removed > 0 && typeof cfg.markerPath === 'string') {
+  fs.writeFileSync(markerPath, JSON.stringify({ ... }))
+}
+```
+
+**后果：**
+
+```text
+如果这次重启时 cookie 是 0 个（干净状态）
+   ↓
+removed = 0
+   ↓
+不写记录
+   ↓
+面板永远显示「还没有实测记录」
+   ↓
+用户永远无法核对推算值
+```
+
+**已改为无条件写：**
+
+```js
+// ⚠️ 不能以 removed > 0 为条件（原实现的缺陷）：
+//    那样「这次没有 cookie 需要清」就什么也不记，
+//    面板永远显示「还没有实测记录」。
+const snapshot = { ... }
+if (typeof cfg.markerPath === 'string' && cfg.markerPath !== '') {
+  fs.writeFileSync(cfg.markerPath, JSON.stringify(snapshot, null, 2), 'utf8')
+}
+```
+
+**这样每次重启都会留下一条实测记录，哪怕这次是 0 个。**
+
+#### 推算值的可信度（必须诚实说明）
+
+**面板的「约 N 个」= 基线后启动次数，不是实测。**
+
+**支持这个模型的数据：**
+
+```text
+证据 1（唯一可对照的样本）:
+  10-22 08:43 ~ 10-26 18:45 期间
+    boot-log 记录:  74 次启动
+    cookie 备份:    71 个（从真实文件读出）
+    偏差:          +3（4.2%）
+
+证据 2（Cookies mtime）:
+  Cookies mtime:   10-27 08:16:38
+  最后一次启动:     10-27 08:16:02
+  相差:            35.8 秒
+  → 证明「每次启动都会写 Cookies 文件」
+
+证据 3（端口唯一性）:
+  71 个 cookie → 71 个唯一端口（零重复）
+  → 证明「每次启动换端口 → 换 cookie 名」
+```
+
+**⚠️ 但必须说清楚：**
+
+```text
+· 样本量 = 1。一个样本不能叫「准确率」。
+· 「各次启动 +1」不是定律：端口理论上会重复（约 0.006%/次），
+  重复那次就不新增。
+· 基线里的 cookieCount=0 来自用户口述（「我清空了」），
+  不是插件独立测得的。
+```
+
+**所以面板现在这样标注：**
+
+```text
+「约 4 个」是推算值，不是实测：…
+推算依据：基线（2026-10-26 19:06 清理后 = 0 个）
+　　　　　+ 之后启动 4 次 × 每次约 +1
+（样本量仅 1 次对照：74 次启动 ↔ 71 个 cookie，偏差 3）
+```
+
+**真实精度需要多次「推算 vs 实测」配对才能确认 —— 每次重启都在积累这个数据。**
+
+#### 两个插件的重启都会记录
+
+**`dsh-fk-restart-button`（侧边栏按钮）和本插件的「重启 DSH」走同一条数据流：**
+
+```text
+点哪个重启按钮
+   ├─ 侧边栏按钮 → dsh-fk-restart-button/lib/relaunch-helper.cjs
+   └─ 面板「重启 DSH」→ dsh-fk-rollback/lib/relaunch-helper.cjs
+              │
+              │ 两个 helper 写同一个文件（helperDir 相同）
+              ▼
+   <DSH_HOME>/restart-helper/cookie-cleanup.json
+              │
+              │ 只有本插件的 entry.js 消费
+              ▼
+   <DSH_HOME>/rollback-snapshots/<profile>/cookie-observed.json
+              │
+              ▼
+   设置 → FK回滚设置 → hover【认证 Cookie】→ 实测详情
+```
+
+**`triggeredBy` 字段用来区分来源：**
+
+| 触发方式 | `triggeredBy` |
+|---|---|
+| 面板「重启 DSH」 | `dsh-fk-rollback (面板「重启 DSH」)` |
+| 侧边栏按钮 | `dsh-fk-restart-button (侧边栏按钮)` |
+
+**面板 hover 里显示为「触发来源：…」。**
+
+---
 
 ### v1.5.1（2026-10-23）
 
@@ -1062,4 +3056,4 @@ const pageItems = primary.slice(0, 10)                      // 第1页只取 10 
 
 ---
 
-*版本 1.5.1 · 2026-10-26*
+*版本 1.5.2 · 2026-10-26*

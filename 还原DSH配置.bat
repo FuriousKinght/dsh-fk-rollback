@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 REM ============================================================
 REM  DSH config restore (FK rollback)  --  dsh-fk-rollback
 REM
-REM  Version: 1.5.1   (must match package.json; modules 1-6 ship as one)
+REM  Version: 1.5.3   (must match package.json; modules 1-6 ship as one)
 REM
 REM  This is the LAST-RESORT path: DSH is broken, the panel
 REM  will not open. This script needs only node.exe.

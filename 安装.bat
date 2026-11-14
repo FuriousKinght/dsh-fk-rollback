@@ -4,6 +4,7 @@ chcp 437 >nul 2>&1
 
 REM ============================================================
 REM  FK rollback plugin - one-click installer
+REM  Version: 1.5.3
 REM
 REM  Why this exists: users run "node install.mjs" from whatever
 REM  directory their shell happens to be in (often C:\Windows\

@@ -26,7 +26,7 @@
  *   node install.mjs --home "C:\Users\Administrator\.dsh"
  *   node install.mjs --dry-run
  *
- * @version 1.5.1
+ * @version 1.5.3
  */
 
 import {

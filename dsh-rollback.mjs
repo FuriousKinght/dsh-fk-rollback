@@ -2,7 +2,7 @@
 /**
  * FK 回滚插件 · 模块二~六：命令行入口
  *
- * @version 1.5.1
+ * @version 1.5.3
  */
 /**
  * FK 回滚设置 —— 命令行脚本（模块六）
@@ -20,12 +20,12 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
 
 import * as C from './lib/core.mjs'
-import { runCheck, computeEffectivePlugins, listDshPackages, parsePatchSubset } from './lib/check.mjs'
+import { runCheck, computeEffectivePlugins, listDshPackages, parsePatchSubset, parseProxyValue, isPortListeningSync } from './lib/check.mjs'
 import { traceFile, listSessionSummaries } from './lib/trace.mjs'
 import * as E from './lib/estate.mjs'
 
@@ -213,7 +213,356 @@ function cmdFix(opts) {
  *   estate --reset --dry-run  预演
  *   estate --reset --force 跳过进程检查（不推荐）
  */
-function cmdEstate(opts) {
+/**
+ * core —— 隔离内核核心包副本（2026-11-04 事故的自动修复）
+ *
+ * 为什么单独一个命令：
+ *   这类问题【回滚救不了】（快照不含 node_modules），
+ *   必须有人真的把那些目录移走。之前 FK 只报不修，用户以为无解。
+ */
+/**
+ * proxy —— 诊断并修复代理环境变量（2026-11-14 事故）
+ *
+ * 三个动作：
+ *   proxy            看当前用户级代理变量 + 端口是否活着
+ *   proxy --fix      删掉指向失效代理的变量（先备份）
+ *   proxy --restore  从备份恢复
+ */
+async function cmdProxy(opts) {
+  const { home } = resolveCtx(opts)
+
+  console.log('')
+  console.log('  代理环境变量诊断' + (opts.fix ? '【修复】' : opts.restore ? '【恢复】' : ''))
+  console.log('  ' + '-'.repeat(62))
+
+  // ── 恢复 ──
+  if (opts.restore) {
+    const r = E.restoreUserProxyEnv({ home })
+    if (!r.ok && r.restored.length === 0) {
+      console.log('')
+      console.log(`  ⚠️ ${r.reason ?? '恢复失败'}`)
+      console.log('')
+      return C.EXIT.ARGS
+    }
+    console.log('')
+    console.log('  已恢复：')
+    for (const x of r.restored) console.log(`    ✓ ${x.key} = ${x.value}`)
+    console.log('')
+    console.log(`  来源：${r.backupPath}`)
+    console.log('')
+    console.log('  ⚠️ 记得【完全重启 DSH】才会生效。')
+    console.log('')
+    return r.ok ? C.EXIT.OK : C.EXIT.PARTIAL
+  }
+
+  // ── 读现状 ──
+  const cur = E.getUserProxyEnv()
+  if (!cur.ok) {
+    console.log('')
+    console.log(`  ⚠️ 读不到用户级环境变量：${cur.error ?? ''}`)
+    console.log('')
+    return C.EXIT.GENERAL
+  }
+
+  const names = Object.keys(cur.values)
+  if (names.length === 0) {
+    console.log('')
+    console.log('  ✅ 当前用户没有任何代理环境变量（干净状态）')
+    console.log('')
+    console.log('     ⓘ 如果你还是遇到「所有模型都报 transport failed」，')
+    console.log('       那原因不在这里，请跑 dsh-rollback check 看其它项。')
+    console.log('')
+    return C.EXIT.OK
+  }
+
+  console.log('')
+  console.log('  用户级（注册表 HKCU\\Environment）代理变量：')
+  // 按 host:port 归并
+  const groups = new Map()
+  for (const [k, v] of Object.entries(cur.values)) {
+    const p = parseProxyValue(v)
+    const id = p.valid ? `${p.host}:${p.port}` : `(无法解析) ${v}`
+    if (!groups.has(id)) groups.set(id, { keys: [], parsed: p })
+    groups.get(id).keys.push(k)
+  }
+
+  let deadCount = 0
+  const deadKeys = []
+  for (const [id, g] of groups) {
+    let status
+    if (g.parsed.valid) {
+      const isLocal = ['127.0.0.1', 'localhost', '::1', '[::1]'].includes(String(g.parsed.host).toLowerCase())
+      if (isLocal) {
+        const probe = isPortListeningSync(g.parsed.port)
+        if (probe.listening) {
+          status = '✅ 代理在运行'
+        } else {
+          status = '❌ 代理没有运行 ← 这就是故障原因'
+          deadCount += 1
+          deadKeys.push(...g.keys)
+        }
+      } else {
+        status = 'ⓘ 远程代理，不做探活'
+      }
+    } else {
+      status = '⚠️ 无法解析这个值'
+    }
+    console.log('')
+    console.log(`    ${g.keys.join(' / ')}`)
+    console.log(`      值：${cur.values[g.keys[0]]}`)
+    console.log(`      状态：${status}`)
+  }
+
+  console.log('')
+
+  if (deadCount === 0) {
+    console.log('  ✅ 所有本机代理端口都在正常运行')
+    console.log('')
+    return C.EXIT.OK
+  }
+
+  // ── 有死的 ──
+  console.log('  ⚠️ 有代理变量指向没有运行的端口。')
+  console.log('     这会让 DSH 0.2.2 的所有模型统一报 "DeepSeek Messages transport failed"。')
+  console.log('')
+
+  if (!opts.fix) {
+    console.log('     两个选择：')
+    console.log('       A. 启动代理软件（如果确实需要代理）')
+    console.log(`       B. 删掉这些变量：dsh-rollback proxy --fix`)
+    console.log('')
+    console.log('     ⓘ 加 --dry-run 可以先看会删什么，不动手。')
+    console.log('')
+    return C.EXIT.NO_SNAPSHOT
+  }
+
+  // ── 执行修复 ──
+  const r = E.clearUserProxyEnv({
+    home,
+    keys: deadKeys,
+    dryRun: Boolean(opts['dry-run']),
+  })
+
+  if (r.dryRun) {
+    console.log('  【预演】将删除：')
+    for (const x of r.removed) console.log(`    · ${x.key} = ${x.value}`)
+    console.log('')
+    console.log('  ⚠️ 这是预演，未做任何修改。去掉 --dry-run 才会真的删。')
+    console.log('')
+    return C.EXIT.OK
+  }
+
+  if (r.reason && r.removed.length === 0 && r.failed.length === 0) {
+    console.log(`  ⓘ ${r.reason}`)
+    console.log('')
+    return C.EXIT.OK
+  }
+
+  console.log('  已删除：')
+  for (const x of r.removed) console.log(`    ✓ ${x.key}（原值：${x.value}）`)
+  if (r.failed.length > 0) {
+    console.log('')
+    console.log('  失败：')
+    for (const f of r.failed) console.log(`    ✗ ${f.key}：${f.reason}`)
+  }
+  console.log('')
+  console.log('  备份（原值已存，可反悔）：')
+  console.log(`    ${r.backupPath}`)
+  console.log('')
+  console.log('  ⚠️ 必须【完全退出 DSH 再启动】才会生效 ——')
+  console.log('     环境变量在进程启动时读取，已运行的进程不会重新读。')
+  console.log('')
+  console.log('  反悔：dsh-rollback proxy --restore')
+  console.log('')
+
+  return r.ok ? C.EXIT.OK : C.EXIT.PARTIAL
+}
+
+async function cmdCore(opts) {
+  const { home, profile } = resolveCtx(opts)
+  const dryRun = Boolean(opts['dry-run'])
+
+  console.log('')
+  console.log('  内核核心包副本隔离' + (dryRun ? '【预演】' : ''))
+  console.log('  ' + '-'.repeat(62))
+  console.log(`  DSH_HOME : ${home}`)
+  console.log(`  profile  : ${profile}`)
+  console.log(`  目标目录 : ${join(home, 'profiles', profile, 'node_modules', '@deepseek-ai')}`)
+  console.log('')
+
+  // 先在运行的检查（quarantineCoreCopies 内部也会查，这里先展示给用户）
+  if (!dryRun && !opts.force) {
+    const run = E.isAppRunning()
+    console.log(`  DSH 进程：${run.reason}`)
+    if (run.running) {
+      console.log('')
+      die(C.EXIT.ARGS,
+        'DSH 还在运行 —— node_modules 里的文件可能被占用，移动会失败。\n'
+        + '    请先【完全退出 DSH】（关窗口 + 确认托盘图标消失），再跑这条命令。')
+    }
+    console.log('')
+  }
+
+  const r = E.quarantineCoreCopies({
+    home, profile,
+    dryRun,
+    force: Boolean(opts.force),
+    ...(typeof opts['backup-to'] === 'string' ? { backupTo: opts['backup-to'] } : {}),
+  })
+
+  if (!r.ok && r.reason) {
+    // 没找到副本不算错误
+    if (r.moved.length === 0 && r.failed.length === 0) {
+      console.log(`  ⓘ ${r.reason}`)
+      console.log('')
+      return C.EXIT.OK
+    }
+    die(C.EXIT.ARGS, r.reason)
+  }
+
+  if (dryRun) {
+    if (r.moved.length === 0) {
+      console.log('  ✅ 没有需要隔离的副本（已经是干净状态）')
+      console.log('')
+      return C.EXIT.OK
+    }
+    console.log(`  将隔离 ${r.moved.length} 个核心包副本：`)
+    for (const m of r.moved) console.log(`    · @deepseek-ai/${m.name}`)
+    console.log('')
+    console.log('  ⚠️ 这是预演，未做任何修改。去掉 --dry-run 才会真正移动。')
+    console.log('')
+    return C.EXIT.OK
+  }
+
+  if (r.moved.length === 0) {
+    console.log(`  ✅ ${r.reason ?? '没有需要隔离的副本'}`)
+    if (r.notFound.length > 0) {
+      console.log(`     （未找到：${r.notFound.join(', ')} —— 正常）`)
+    }
+    console.log('')
+    return C.EXIT.OK
+  }
+
+  console.log('  已隔离：')
+  for (const m of r.moved) {
+    console.log(`    ✓ @deepseek-ai/${m.name}`)
+  }
+  if (r.emptyDirMoved) {
+    console.log('    ✓ node_modules/@deepseek-ai（空目录，一并移走）')
+  }
+  console.log('')
+  console.log('  备份位置（移动，不是删除 —— 便于排查和反悔）：')
+  console.log(`    ${r.backupRoot}`)
+  console.log('')
+  if (r.failed.length > 0) {
+    console.log('  ⚠️ 有失败项：')
+    for (const f of r.failed) console.log(`    ✗ @deepseek-ai/${f.name}：${f.reason}`)
+    console.log('')
+  }
+  console.log('  ✅ 完成。现在启动 DSH，然后跑一次确认：')
+  console.log('     dsh-rollback check')
+  console.log('')
+  console.log('  ⓘ 为什么要移走这几个包：')
+  console.log('    它们与内核自带的同名包形成两套模块实例，')
+  console.log('    导致 dsh-scope 的作用域判断失效（按对象身份 ===，两份实例认不出彼此）')
+  console.log('    → 所有 Agent 预设报 prompt section is already registered')
+  console.log('    → 新建会话、恢复会话全部失败。')
+  console.log('')
+  console.log('  ⓘ cosmokit / schemastery 不在此列 —— 它们用 Symbol.for 做跨实例识别，')
+  console.log('    多一份无害，可以保留。')
+  console.log('')
+  return r.failed.length > 0 ? C.EXIT.PARTIAL : C.EXIT.OK
+}
+
+async function cmdEstate(opts) {
+  // parseArgs 不转换驼峰，所以 --app-data 会落在 opts['app-data'] 上。
+  // 统一成一个变量，供下面的检查与清理共用。
+  const appDataOpt = opts.appData ?? opts['app-data']
+
+  // ── 清理认证 Cookie（v1.5.2 新增）──
+  //
+  // 对应 2026-10-26 事故：
+  //   DSH 每次启动用 sha256(host:端口) 生成 cookie 名，旧的不清理，
+  //   累积 71 个后请求头 16,584 B > Node 上限 16,384
+  //   → HPE_HEADER_OVERFLOW → "Web authentication failed" 起不来。
+  if (opts['clean-cookies']) {
+    const dryRun = Boolean(opts['dry-run'])
+    const { root } = resolveCtx(opts)
+
+    console.log('')
+    console.log('  清理累积的认证 Cookie' + (dryRun ? '【预演】' : ''))
+    console.log('  ' + '-'.repeat(62))
+
+    // 前置：进程检查（cleanAuthCookies 内部也会查，这里先展示给用户看）
+    if (!dryRun && !opts.force) {
+      const run = E.isAppRunning()
+      console.log(`  DSH 进程：${run.reason}`)
+      if (run.running) {
+        console.log('')
+        die(C.EXIT.ARGS,
+          'DSH 还在运行 —— Cookies 库被 Chromium 独占锁定，删不掉。\n'
+          + '    请先【完全退出 DSH】（关窗口 + 确认托盘图标消失），再跑这条命令。')
+      }
+      console.log('')
+    }
+
+    // 备份放到快照根下，用户容易找到（而不是系统临时目录）
+    const stamp = new Date().toISOString().replace(/[-:T.]/g, '').slice(0, 15)
+    const backupDir = join(root, 'cookie-backups', stamp)
+
+    const r = await E.cleanAuthCookies({
+      dryRun,
+      force: Boolean(opts.force),
+      backupDir: dryRun ? undefined : backupDir,
+      ...appDataOpt ? { appData: appDataOpt } : {},
+    })
+
+    if (!r.ok && r.reason) die(C.EXIT.ARGS, r.reason)
+
+    if (dryRun) {
+      if (r.removed === 0 && r.wouldRemove === undefined) {
+        console.log(`  ⓘ ${r.reason ?? '没有需要清理的 cookie'}`)
+        console.log('')
+        return C.EXIT.OK
+      }
+      console.log(`  库内 cookie：${r.totalBefore}`)
+      console.log(`  待删 dsh-auth-*：${r.wouldRemove}`)
+      console.log('')
+      console.log('  ⚠️ 这是预演，未做任何修改。去掉 --dry-run 才会真正删除。')
+      console.log('')
+      return C.EXIT.OK
+    }
+
+    if (r.removed === 0) {
+      console.log(`  ⓘ ${r.reason ?? '没有需要清理的 cookie'}`)
+      if (r.totalBefore !== undefined) {
+        console.log(`     库内共 ${r.totalBefore} 个 cookie，但没有累积的 dsh-auth-*`)
+      }
+      console.log('')
+      return C.EXIT.OK
+    }
+
+    console.log('  已删除：')
+    console.log(`    ✓ ${r.removed} 个 dsh-auth-* cookie`)
+    if (r.after !== null && r.after !== undefined) {
+      console.log(`    ✓ 剩余 dsh-auth-*：${r.after} 个`)
+    }
+    if (r.journalRemoved) {
+      console.log('    ✓ Cookies-journal 已清理')
+    } else if (r.journalExistedBefore) {
+      console.log('    ⓘ Cookies-journal 由 SQLite 自行清理（正常）')
+    }
+    console.log('')
+    console.log('  备份：')
+    console.log(`    ${r.backupPath}`)
+    console.log('')
+    console.log('  ✅ 完成。现在启动 DSH 即可。')
+    console.log('  ⓘ 账号不受影响 —— 登录凭据在 $DSH_HOME/.credentials.yaml，')
+    console.log('    不在 Cookie 里。下次启动会自动签发新的认证 Cookie。')
+    console.log('')
+    return C.EXIT.OK
+  }
+
   // ── 重置模式（最后手段：备份也没有时才用）──
   if (opts.reset) {
     const dryRun = Boolean(opts['dry-run'])
@@ -272,7 +621,8 @@ function cmdEstate(opts) {
   }
 
   // ── 检查模式（默认，只读）──
-  const chk = E.checkEstate(opts.appData ? { appData: opts.appData } : {})
+  let cookieNeedsClean = false
+  const chk = E.checkEstate(appDataOpt ? { appData: appDataOpt } : {})
 
   console.log('')
   console.log('  Electron 运行时状态体检')
@@ -320,14 +670,125 @@ function cmdEstate(opts) {
   }
   console.log('')
 
+  // ── 认证 Cookie 累积检测（v1.5.2 新增）──
+  //
+  // 2026-10-26 事故：DSH 每次启动用 sha256(host:端口) 生成 cookie 名，
+  // 端口动态变化 → 每次新增一个 → 累积 71 个后请求头超 16 KB → 起不来。
+  const ck = await E.checkAuthCookies(appDataOpt ? { appData: appDataOpt } : {})
+
+  console.log('  ── 认证 Cookie 累积 ──')
+
+  if (!ck.readable) {
+    // 读不到：多半是 DSH 在运行（Chromium 独占锁定）
+    console.log(`    ⓘ ${ck.reason ?? '内容读不到'}`)
+    if (ck.running) {
+      console.log('      这是正常的 —— Cookies 库运行时被 Chromium 独占。')
+      console.log('      如需检查累积情况，请完全退出 DSH 后重跑本命令。')
+    }
+
+    // ⭐ 用「基线 + 启动次数」给一个估算值，否则用户完全看不到数量概念
+    try {
+      const { root } = resolveCtx(opts)
+      const bootLog = C.readBootLog(root)
+      const boots = (bootLog.records ?? []).length
+      const est = E.estimateAuthCookies(root, boots)
+      if (est) {
+        const ratio = (est.count * 228) / E.COOKIE_BUDGET
+        const pct = (ratio * 100).toFixed(0)
+        const icon = ratio >= 1 ? '🔴' : ratio >= 0.95 ? '⚠️' : ratio >= 0.85 ? 'ⓘ' : '✅'
+        console.log('')
+        console.log(`    ${icon} 估算 ${est.count} 个（占上限约 ${pct}%）`)
+        console.log(`       自 ${new Date(Date.parse(est.baselineAt)).toLocaleString('zh-CN', { hour12: false })} 清理后`)
+        console.log(`       已启动 ${est.bootsSince} 次 · 每次启动 +1 个`)
+        if (ratio >= 0.85) {
+          console.log('       ⚠️ 接近上限，建议尽快清理')
+        }
+      } else {
+        console.log('')
+        console.log('    ⓘ 没有清理基线，无法估算数量')
+        console.log('      跑一次 dsh-rollback estate --clean-cookies 后会建立基线')
+      }
+    } catch { /* 估算失败不影响主流程 */ }
+  } else if (ck.cookies) {
+    const c = ck.cookies
+    const pct = (c.ratio * 100).toFixed(1)
+
+    if (c.level === 'normal') {
+      console.log(`    ✅ ${c.auth} 个 dsh-auth-*（请求头 ${c.headerBytes} B / 上限 ${c.budget} B，占 ${pct}%）`)
+    } else {
+      const icon = c.level === 'fatal' ? '🔴' : c.level === 'error' ? '⚠️' : 'ⓘ'
+      const verdict = c.level === 'fatal'
+        ? '已达上限 —— 这就是 DSH 起不来的原因'
+        : c.level === 'error'
+          ? '接近上限 —— 再重启几次就会起不来'
+          : '开始累积 —— 建议清理'
+      console.log(`    ${icon} ${c.auth} 个 dsh-auth-*（请求头 ${c.headerBytes} B / 上限 ${c.budget} B，占 ${pct}%）`)
+      console.log(`       ${verdict}`)
+      if (c.ports.length > 1) {
+        console.log(`       涉及 ${c.ports.length} 个不同端口（每次启动换一个端口 → 多一个 cookie）`)
+      }
+      if (c.oldest && c.newest) {
+        const d = (ms) => new Date(ms).toLocaleString('zh-CN', { hour12: false })
+        console.log(`       最早 ${d(c.oldest)}  →  最晚 ${d(c.newest)}`)
+      }
+      console.log('')
+      console.log('       修复：完全退出 DSH，然后运行')
+      console.log('         dsh-rollback estate --clean-cookies')
+      console.log('       或直接双击插件目录里的「清除旧Cookies.bat」')
+      cookieNeedsClean = c.level !== 'normal'
+    }
+  }
+  console.log('')
+
   if (chk.problems.length > 0) {
-    console.log('  👉 修复办法 —— 状态现在包含在快照里，直接还原即可：')
-    console.log('       1. 完全退出 DSH')
-    console.log('       2. dsh-rollback list                # 看有哪些快照')
-    console.log('       3. dsh-rollback restore <快照id>    # 配置 + 状态一起还原')
-    console.log('')
-    console.log('     如果所有快照都没有状态部分，只能重置（会清掉浏览器会话凭据）：')
-    console.log('       dsh-rollback estate --reset')
+    // ⚠️ 有些问题【回滚救不了】—— 必须分开说，否则用户会白试一遍。
+    //
+    //   2026-11-04 事故：node_modules 里的核心包副本导致所有预设 broken。
+    //   用户试了回滚，发现无效 —— 因为快照根本不含 node_modules。
+    const coreDup = chk.problems.filter((x) => x.code === 'core-package-duplicate')
+    const others = chk.problems.filter((x) => x.code !== 'core-package-duplicate')
+
+    if (coreDup.length > 0) {
+      console.log('  👉 内核核心包副本 —— 这个问题【回滚救不了】')
+      console.log('')
+      console.log('     原因：快照只备份 5 个配置文件 + Electron 状态，')
+      console.log('           不包含 node_modules（设计如此：它本可由 lockfile 重建）。')
+      console.log('           但核心包副本不在 lockfile 里，pnpm 既不重建也不清理它。')
+      console.log('')
+      console.log('     正确做法（移动，不要删除，便于排查）：')
+      console.log('       1. 完全退出 DSH')
+      console.log('       2. 新建备份目录，例如：')
+      console.log('          mkdir "<DSH_HOME>\_backup-core-copy-<日期>"')
+      console.log('       3. 把这些目录移进去：')
+      for (const p of coreDup) {
+        const pkgs = Array.isArray(p.packages) ? p.packages : []
+        for (const name of pkgs) {
+          console.log(`          node_modules\\@deepseek-ai\\${name}`)
+        }
+      }
+      console.log('       4. 启动 DSH，再跑一次 dsh-rollback check 确认')
+      console.log('')
+      console.log('     ⚠️ 注意：cosmokit / schemastery 是纯工具库，')
+      console.log('        有些插件依赖它们，可以保留（只报警告，不致命）。')
+      console.log('')
+    }
+
+    if (others.length > 0) {
+      console.log('  👉 其余问题 —— 状态已包含在快照里，直接还原即可：')
+      console.log('       1. 完全退出 DSH')
+      console.log('       2. dsh-rollback list                # 看有哪些快照')
+      console.log('       3. dsh-rollback restore <快照id>    # 配置 + 状态一起还原')
+      console.log('')
+      console.log('     如果所有快照都没有状态部分，只能重置（会清掉浏览器会话凭据）：')
+      console.log('       dsh-rollback estate --reset')
+      console.log('')
+    }
+
+    return C.EXIT.NO_SNAPSHOT
+  }
+
+  if (cookieNeedsClean) {
+    console.log('  ⚠️ 认证 Cookie 需要清理（见上）。')
     console.log('')
     return C.EXIT.NO_SNAPSHOT
   }
@@ -471,7 +932,13 @@ function cmdCheck(opts) {
 
   console.log(`\n  DSH 配置体检 — ${profile}`)
   console.log(`  ${'-'.repeat(60)}`)
-  console.log(`\n  ${problems.length + notices.length === 0 ? '✅' : '⚠️ '} ${report.verdict ?? ''}`)
+  // 有「回滚治不了」的问题时，verdict 不能笼统写「建议回滚」
+  const NON_RESTORABLE = ['core-package-duplicate', 'proxy-env-dead']
+  const hasNonRestorable = problems.some((x) => NON_RESTORABLE.includes(x.code))
+  const verdictText = hasNonRestorable && report.counts.fatal > 0
+    ? '有致命问题 —— 其中有的【回滚救不了】，请看下方专项指引'
+    : (report.verdict ?? '')
+  console.log(`\n  ${problems.length + notices.length === 0 ? '✅' : '⚠️ '} ${verdictText}`)
   console.log(`  真问题 ${problems.length} · 提示 ${notices.length}`
     + ` · 正常状态 ${normal.length}（无需处理）`
     + (acked.length ? ` · 已确认 ${acked.length}` : ''))
@@ -509,9 +976,87 @@ function cmdCheck(opts) {
     if (opts.verbose) dump(acked)
     else console.log(`     （已不计入判断；用 --verbose 查看，或在面板里管理）`)
   }
+
+  // ── 修复指引 ──
+  //
+  // ⚠️ 必须区分「回滚能救」与「回滚救不了」两类问题。
+  //
+  //   2026-11-04 事故：node_modules/@deepseek-ai/ 里的核心包副本
+  //   导致所有 Agent 预设 broken。用户第一反应是回滚 —— 但无效，
+  //   因为快照设计上就不含 node_modules。白试一遍很挫败。
+  if (problems.length > 0) {
+    // 分类：哪些【回滚/还原快照治不了】，必须单独说
+    const NO_RESTORE_CODES = ['core-package-duplicate', 'proxy-env-dead']
+    const coreDup = problems.filter((x) => x.code === 'core-package-duplicate')
+    const proxyDead = problems.filter((x) => x.code === 'proxy-env-dead')
+    const others = problems.filter((x) => !NO_RESTORE_CODES.includes(x.code))
+
+    if (proxyDead.length > 0) {
+      console.log('  👉 代理环境变量指向失效代理 —— 这个问题【回滚/重启都救不了】')
+      console.log('')
+      console.log('     原因：变量存在【注册表】（HKCU\\Environment），')
+      console.log('           既不在快照范围内，也不会随 DSH 重启而改变。')
+      console.log('')
+      console.log('     它为什么让所有模型都挂：')
+      console.log('       DSH 0.2.2 起会在启动时读取 HTTP_PROXY / HTTPS_PROXY，')
+      console.log('       把全局 HTTP dispatcher 换成指向该代理的 ProxyAgent。')
+      console.log('       代理没开 → 每一条出站请求全部失败 →')
+      console.log('       所有 provider 统一报 "DeepSeek Messages transport failed"。')
+      console.log('       这个报错完全不指向真因，换模型、换 provider、查密钥都是白试。')
+      console.log('')
+      for (const p of proxyDead) {
+        const pkgs = Array.isArray(p.packages) ? p.packages : []
+        if (pkgs.length > 0) console.log(`     涉及：${pkgs.join('、')}`)
+      }
+      console.log('')
+      console.log('     两个选择（任选一个，然后【完全重启 DSH】）：')
+      console.log('       A. 启动代理软件（如果确实需要代理）')
+      console.log('       B. 删掉这两个用户级变量：')
+      console.log('            [Environment]::SetEnvironmentVariable("HTTP_PROXY",$null,"User")')
+      console.log('            [Environment]::SetEnvironmentVariable("HTTPS_PROXY",$null,"User")')
+      console.log('')
+    }
+
+    if (coreDup.length > 0) {
+      console.log('  👉 内核核心包副本 —— 这个问题【回滚救不了】')
+      console.log('')
+      console.log('     原因：快照只备份 5 个配置文件 + Electron 状态，不含 node_modules。')
+      console.log('           （设计如此：它本可由 lockfile 重建。但核心包副本不在 lockfile 里，')
+      console.log('            pnpm 既不重建也不清理它 —— 所以只能手动移走。）')
+      console.log('')
+      console.log('     正确做法（移动，不要删除，便于排查）：')
+      console.log('       1. 完全退出 DSH（关窗口 + 确认托盘图标消失）')
+      console.log('       2. 新建备份目录：')
+      console.log('          mkdir "<DSH_HOME>\_backup-core-copy-<日期>"')
+      console.log('       3. 把这些目录移进去：')
+      for (const p of coreDup) {
+        const pkgs = Array.isArray(p.packages) ? p.packages : []
+        for (const name of pkgs) {
+          console.log(`          ${join(profileDirName(home, profile), 'node_modules', '@deepseek-ai', name)}`)
+        }
+      }
+      console.log('       4. 启动 DSH，再跑一次 dsh-rollback check 确认')
+      console.log('')
+      console.log('     ⓘ cosmokit / schemastery 是纯工具库，有些插件依赖它们，')
+      console.log('       可以保留（只报警告，不致命）。')
+      console.log('')
+    }
+
+    if (others.length > 0) {
+      console.log('  👉 其余问题 —— 可尝试还原快照：')
+      console.log('       dsh-rollback list                # 看有哪些快照')
+      console.log('       dsh-rollback restore <快照id>    # 配置 + 状态一起还原')
+      console.log('')
+    }
+  }
   console.log('')
 
   return report.counts.fatal > 0 ? C.EXIT.NO_SNAPSHOT : C.EXIT.OK
+}
+
+/** profile 目录名（用于打印路径提示）。 */
+function profileDirName(home, profile) {
+  return join(home, 'profiles', profile)
 }
 
 /** 读启动基线（体检的比对基准）。 */
@@ -986,9 +1531,10 @@ function showHelp() {
     status                      当前配置状态摘要
 
   ── 检查类 ──
-    check                       静态体检
+    check                       静态体检（已装好的配置）
       --json                      JSON 输出
       --home-layer                只检查 $DSH_HOME/cordis.patch.yml
+
     diagnose                    诊断（含依赖图、home 层排查）
 
   ── 创建类 ──
@@ -998,9 +1544,23 @@ function showHelp() {
       --note <备注>               备注
       --origin <auto|ai|user>     强制指定来源（默认自动探测）
 
+  proxy                     诊断代理环境变量（所有模型报 transport failed 时用）
+    --fix                     删掉指向失效代理的变量（先备份，可 --restore 反悔）
+    --dry-run                 配合 --fix 使用，只显示会删什么
+    --restore                 从备份恢复
+                            ⚠️ 变量在注册表里，回滚快照治不了
+
+  core                      隔离内核核心包副本（装插件后预设全坏时用）
+    --dry-run                 只显示会移走什么，不实际移动
+    --backup-to <目录>         自定义备份位置（默认 <DSH_HOME>/_backup-core-copy-<时间戳>）
+                            ⚠️ 这类问题【回滚救不了】—— 快照不含 node_modules
+
   estate                    体检 Electron 运行时状态（认证库 / cookie 库 / 锁文件）
+  estate --clean-cookies    清理累积的 dsh-auth-* Cookie（需先完全退出 DSH）
+    --dry-run                 只显示会删多少，不实际删除
   estate --reset            重置运行时状态（会清掉浏览器会话凭据；最后手段）
                             ⚠️ 备份/还原不用它 —— 已并入 snapshot / restore
+  以上都支持 --app-data <路径> 指定 Electron userData（默认自动探测）
 
   ── 还原类 ──
     restore <id>                还原到指定快照
@@ -1055,13 +1615,15 @@ const COMMANDS = {
   paths: cmdPaths,
   diagnose: cmdDiagnose,
   estate: cmdEstate,
+  core: cmdCore,
+  proxy: cmdProxy,
   oplog: cmdOplog,
 }
 
-function main() {
+async function main() {
   const opts = parseArgs(process.argv.slice(2))
   if (opts.help || opts.h) { showHelp(); process.exit(C.EXIT.OK) }
-  if (opts.version || opts.v) { console.log('dsh-rollback v1.5.1'); process.exit(C.EXIT.OK) }
+  if (opts.version || opts.v) { console.log('dsh-rollback v1.5.3'); process.exit(C.EXIT.OK) }
 
   const cmd = opts._[0]
   const fn = COMMANDS[cmd]
@@ -1076,7 +1638,7 @@ function main() {
   const t0 = Date.now()
   let code = C.EXIT.OK
   try {
-    code = fn(opts) ?? C.EXIT.OK
+    code = (await fn(opts)) ?? C.EXIT.OK
   } catch (e) {
     const msg = String(e?.message ?? e)
     if (/EACCES|EPERM|EBUSY/.test(msg)) die(C.EXIT.PERMISSION, msg)
@@ -1105,4 +1667,4 @@ function redactArg(a) {
   return String(a).replace(/sk-[a-zA-Z0-9]{20,}/g, 'sk-***').slice(0, 200)
 }
 
-main()
+await main()
