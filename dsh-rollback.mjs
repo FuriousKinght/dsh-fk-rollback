@@ -2,7 +2,7 @@
 /**
  * FK 回滚插件 · 模块二~六：命令行入口
  *
- * @version 1.5.3
+ * @version 1.6.0
  */
 /**
  * FK 回滚设置 —— 命令行脚本（模块六）
@@ -20,6 +20,7 @@
  */
 
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { dirname } from 'node:path'
@@ -31,27 +32,169 @@ import * as E from './lib/estate.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 
+/** DSH 版本：显式参数/环境变量优先，否则读取实际安装包。 */
+function detectDshVersion(explicit, home) {
+  if (typeof explicit === 'string' && explicit) return explicit
+  if (typeof process.env.DSH_VERSION === 'string' && process.env.DSH_VERSION) return process.env.DSH_VERSION
+  try {
+    const require = createRequire(import.meta.url)
+    const manifest = require('@deepseek-ai/dsh/package.json')
+    if (manifest?.name === '@deepseek-ai/dsh' && typeof manifest.version === 'string' && manifest.version) return manifest.version
+  } catch { /* 独立脚本环境没有可解析的安装包，继续查 manifest */ }
+  const candidates = []
+  if (process.env.DSH_INSTALL_DIR) candidates.push(process.env.DSH_INSTALL_DIR)
+  if (process.env.DSH_NODE_EXECUTABLE) {
+    try {
+      const exeDir = dirname(process.env.DSH_NODE_EXECUTABLE)
+      candidates.push(join(exeDir, '..', 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh'))
+      candidates.push(join(exeDir, '..', '..', 'resources', 'app.asar', 'dsh', 'node_modules', '@deepseek-ai', 'dsh'))
+    } catch { /* 忽略 */ }
+  }
+  if (home) {
+    candidates.push(join(home, 'dsh-runtimes', 'dsh-primary-runtime'))
+    candidates.push(join(home, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', '@deepseek-ai', 'dsh'))
+  }
+  for (const dir of candidates) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+      if (pkg.name === '@deepseek-ai/dsh' && typeof pkg.version === 'string' && pkg.version) return pkg.version
+    } catch { /* 尝试下一个已验证候选 */ }
+  }
+  return null
+}
+
 // ─────────────────────────────────────────────────────────────
 // 参数解析（手写，零依赖）
 // ─────────────────────────────────────────────────────────────
 
+const GLOBAL_FLAGS = new Set(['help', 'h', 'version', 'v', 'json', 'verbose', 'dry-run', 'force', 'home-layer'])
+const GLOBAL_VALUES = new Set(['home', 'profile', 'dsh-version'])
+const VALUE_OPTIONS = new Set([
+  'home', 'profile', 'dsh-version', 'name', 'note', 'origin', 'slot',
+  'backup-to', 'app-data', 'days', 'tail',
+])
+const FLAG_OPTIONS = new Set([
+  'help', 'h', 'version', 'v', 'json', 'verbose', 'dry-run', 'force',
+  'unpin', 'show', 'clear', 'pin', 'restore', 'fix', 'clean-cookies',
+  'reset', 'daily', 'last-good', 'from-pool', 'home-layer',
+])
+const COMMAND_OPTIONS = {
+  list: [],
+  show: [],
+  status: [],
+  check: ['json', 'verbose', 'home-layer'],
+  diagnose: ['json', 'verbose'],
+  snapshot: ['daily', 'name', 'note', 'origin'],
+  proxy: ['fix', 'restore', 'dry-run'],
+  core: ['dry-run', 'force', 'backup-to'],
+  estate: ['clean-cookies', 'reset', 'dry-run', 'force', 'app-data'],
+  restore: ['last-good', 'from-pool', 'dry-run'],
+  trace: ['days'],
+  sessions: ['days'],
+  prune: ['dry-run'],
+  fix: ['unpin', 'show', 'clear', 'pin', 'slot'],
+  paths: [],
+  oplog: ['tail'],
+}
+const POSITIONAL_LIMITS = { show: 1, fix: 1, restore: 1, trace: 1 }
+const ORIGINS = new Set(['auto', 'ai', 'user'])
+
+function positiveInteger(value, name) {
+  const n = Number(value)
+  if (!Number.isInteger(n) || n <= 0) die(C.EXIT.ARGS, `${name} 必须是正整数`)
+  return n
+}
+
 function parseArgs(argv) {
   const opts = { _: [] }
+  const seen = new Set()
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]
-    if (a.startsWith('--')) {
-      const eq = a.indexOf('=')
-      if (eq > 0) {
-        opts[a.slice(2, eq)] = a.slice(eq + 1)
-      } else {
-        const key = a.slice(2)
-        const next = argv[i + 1]
-        if (next !== undefined && !next.startsWith('--')) { opts[key] = next; i += 1 }
-        else opts[key] = true
-      }
-    } else {
-      opts._.push(a)
+    if (a === '--') {
+      opts._.push(...argv.slice(i + 1))
+      break
     }
+    if (!a.startsWith('--')) {
+      opts._.push(a)
+      continue
+    }
+    const eq = a.indexOf('=')
+    const key = a.slice(2, eq < 0 ? undefined : eq)
+    if (!key || !FLAG_OPTIONS.has(key) && !VALUE_OPTIONS.has(key)) {
+      die(C.EXIT.ARGS, `未知选项：--${key || a.slice(2)}`)
+    }
+    if (seen.has(key)) die(C.EXIT.ARGS, `选项重复：--${key}`)
+    seen.add(key)
+
+    if (FLAG_OPTIONS.has(key)) {
+      if (eq >= 0) die(C.EXIT.ARGS, `--${key} 不接受值`)
+      opts[key] = true
+      continue
+    }
+
+    let value
+    if (eq >= 0) value = a.slice(eq + 1)
+    else {
+      value = argv[i + 1]
+      if (value === undefined || value === '--' || value.startsWith('--')) {
+        die(C.EXIT.ARGS, `--${key} 缺少值`)
+      }
+      i += 1
+    }
+    if (value === '') die(C.EXIT.ARGS, `--${key} 缺少值`)
+    opts[key] = value
+  }
+
+  const setFlag = (...keys) => keys.filter((key) => opts[key] === true)
+  const countFlags = (...keys) => setFlag(...keys).length
+  if (opts.help || opts.h || opts.version || opts.v) {
+    if (opts._.length > 0 || seen.size > setFlag('help', 'h', 'version', 'v').length) {
+      die(C.EXIT.ARGS, '--help/--version 不能与命令或其他选项一起使用')
+    }
+    return opts
+  }
+  if (opts._.length === 0) die(C.EXIT.ARGS, '缺少命令；用 --help 查看可用命令')
+  const cmd = opts._[0]
+  if (!Object.prototype.hasOwnProperty.call(COMMAND_OPTIONS, cmd)) {
+    die(C.EXIT.ARGS, `未知命令：${cmd}`)
+  }
+  const allowed = new Set([...GLOBAL_FLAGS, ...GLOBAL_VALUES, ...COMMAND_OPTIONS[cmd]])
+  for (const key of seen) {
+    if (!allowed.has(key)) die(C.EXIT.ARGS, `命令 ${cmd} 不接受 --${key}`)
+  }
+
+  const limit = POSITIONAL_LIMITS[cmd] ?? 0
+  if (opts._.length - 1 > limit) die(C.EXIT.ARGS, `命令 ${cmd} 的位置参数过多`)
+  if ((cmd === 'show' || cmd === 'fix') && opts._.length < 2 && !setFlag('show', 'clear', 'unpin', 'pin').length) {
+    die(C.EXIT.ARGS, `${cmd} 需要快照 ID`)
+  }
+  if (cmd === 'restore') {
+    const selectors = countFlags('last-good', 'from-pool') + (opts._.length > 1 ? 1 : 0)
+    if (selectors > 1) die(C.EXIT.ARGS, 'restore 的快照 ID、--last-good、--from-pool 只能选一个')
+    if (opts['last-good'] && opts['from-pool']) die(C.EXIT.ARGS, '--last-good 与 --from-pool 不能同时使用')
+  }
+  const actions = (names) => countFlags(...names)
+  if (cmd === 'proxy' && actions(['fix', 'restore']) > 1) die(C.EXIT.ARGS, 'proxy 的 --fix 与 --restore 不能同时使用')
+  if (cmd === 'proxy' && opts['dry-run'] && !opts.fix) die(C.EXIT.ARGS, 'proxy --dry-run 需要配合 --fix')
+  if (cmd === 'estate' && actions(['clean-cookies', 'reset']) > 1) die(C.EXIT.ARGS, 'estate 的 --clean-cookies 与 --reset 不能同时使用')
+  if (cmd === 'check' && opts['home-layer'] && (opts.json || opts.verbose)) {
+    die(C.EXIT.ARGS, 'check --home-layer 不能与 --json/--verbose 一起使用')
+  }
+  if (cmd === 'fix' && actions(['unpin', 'show', 'clear']) > 1) die(C.EXIT.ARGS, 'fix 的 --unpin/--show/--clear 只能选一个')
+  if (cmd === 'fix' && opts.pin && actions(['unpin', 'show', 'clear']) > 0) die(C.EXIT.ARGS, 'fix --pin 不能与 --unpin/--show/--clear 一起使用')
+  if (cmd === 'fix' && opts._.length > 1 && actions(['unpin', 'show', 'clear']) > 0) {
+    die(C.EXIT.ARGS, 'fix 的 --unpin/--show/--clear 不能同时指定快照 ID')
+  }
+  if (opts.origin !== undefined && !ORIGINS.has(opts.origin)) {
+    die(C.EXIT.ARGS, '--origin 只能是 auto、ai 或 user')
+  }
+  if (opts.days !== undefined) opts.days = positiveInteger(opts.days, '--days')
+  if (opts.tail !== undefined) opts.tail = positiveInteger(opts.tail, '--tail')
+  if (opts.profile !== undefined && (opts.profile === '.' || opts.profile === '..' || /[\\/]/.test(opts.profile))) {
+    die(C.EXIT.ARGS, '--profile 必须是单个目录名')
+  }
+  if (opts.slot !== undefined && (opts.slot === '.' || opts.slot === '..' || /[\\/]/.test(opts.slot))) {
+    die(C.EXIT.ARGS, '--slot 必须是单个目录名')
   }
   return opts
 }
@@ -152,7 +295,18 @@ function cmdFix(opts) {
   }
 
   const id = opts._[0]
-  if (!id) die(C.EXIT.ARGS, 'fix 需要一个快照 ID（或用 --show 查看 / --clear 取消）')
+  if (!id) {
+    const slot = opts.slot ?? C.FIXED_SLOT_DEFAULT
+    const cur = C.readFixedSlot(root, slot)
+    if (!cur) die(C.EXIT.NO_SNAPSHOT, '当前没有固化副本，无法设置钉住状态')
+    const mp = join(C.fixedSlotDir(root, slot), 'meta.json')
+    const meta = C.readJson(mp) ?? {}
+    meta.pin = true
+    C.writeJsonAtomic(mp, meta)
+    console.log(`\n  📌 已钉住当前固化副本：${meta.fromName ?? cur.meta?.fromName ?? '?'}`)
+    console.log('     启动时不会自动替换；取消：dsh-rollback.mjs fix --unpin\n')
+    return C.EXIT.OK
+  }
 
   const e = (idx.entries ?? []).find((x) => x.id === id)
   if (!e) die(C.EXIT.NO_SNAPSHOT, `找不到快照：${id}`)
@@ -583,7 +737,11 @@ async function cmdEstate(opts) {
       console.log('')
     }
 
-    const r = E.resetEstate({ dryRun, force: Boolean(opts.force) })
+    const r = E.resetEstate({
+      dryRun,
+      force: Boolean(opts.force),
+      ...appDataOpt ? { appData: appDataOpt } : {},
+    })
     if (!r.ok && r.reason) die(C.EXIT.ARGS, r.reason)
 
     if (dryRun) {
@@ -885,6 +1043,7 @@ function cmdList(opts) {
 /** check —— 体检。 */
 function cmdCheck(opts) {
   const { home, profile } = resolveCtx(opts)
+  const dshVersion = detectDshVersion(opts['dsh-version'], home)
 
   // --home-layer：只检查 home 层
   if (opts['home-layer']) {
@@ -916,11 +1075,11 @@ function cmdCheck(opts) {
   }
 
   const baseline = readBaseline(opts)
-  const report = runCheck({ home, profile, baseline, dshVersion: opts['dsh-version'] })
+  const report = runCheck({ home, profile, baseline, dshVersion })
 
   if (opts.json) {
     console.log(JSON.stringify({ profile, ...report }, null, 2))
-    return C.EXIT.OK
+    return report.counts.fatal > 0 ? C.EXIT.NO_SNAPSHOT : C.EXIT.OK
   }
 
   // 分层输出（2026-10-19 重做）：只报真问题，正常状态单独归拢
@@ -933,7 +1092,7 @@ function cmdCheck(opts) {
   console.log(`\n  DSH 配置体检 — ${profile}`)
   console.log(`  ${'-'.repeat(60)}`)
   // 有「回滚治不了」的问题时，verdict 不能笼统写「建议回滚」
-  const NON_RESTORABLE = ['core-package-duplicate', 'proxy-env-dead']
+  const NON_RESTORABLE = ['core-package-duplicate', 'proxy-env-dead', 'crash-recent']
   const hasNonRestorable = problems.some((x) => NON_RESTORABLE.includes(x.code))
   const verdictText = hasNonRestorable && report.counts.fatal > 0
     ? '有致命问题 —— 其中有的【回滚救不了】，请看下方专项指引'
@@ -986,10 +1145,35 @@ function cmdCheck(opts) {
   //   因为快照设计上就不含 node_modules。白试一遍很挫败。
   if (problems.length > 0) {
     // 分类：哪些【回滚/还原快照治不了】，必须单独说
-    const NO_RESTORE_CODES = ['core-package-duplicate', 'proxy-env-dead']
+    const NO_RESTORE_CODES = ['core-package-duplicate', 'proxy-env-dead', 'crash-recent']
     const coreDup = problems.filter((x) => x.code === 'core-package-duplicate')
     const proxyDead = problems.filter((x) => x.code === 'proxy-env-dead')
     const others = problems.filter((x) => !NO_RESTORE_CODES.includes(x.code))
+
+    // ── 崩溃：还原快照也治不了 ──
+    const crashRecent = problems.filter((x) => x.code === 'crash-recent')
+    if (crashRecent.length > 0) {
+      console.log('  👉 DSH 崩过 —— 这个问题【还原快照也救不了】')
+      console.log('')
+      console.log('     原因：崩溃是程序运行时的错误（比如 Electron 主进程竞态、')
+      console.log('           某个插件抛异常），不是配置文件坏了。')
+      console.log('           快照只备份 5 个配置文件，还原不了一个已经发生的崩溃。')
+      console.log('')
+      console.log('     该怎么看：')
+      for (const p of crashRecent) {
+        console.log('       日志：' + String(p.file ?? ''))
+      }
+      console.log('')
+      console.log('     注意：崩溃报告只记录【第一个】错误，后续错误会被丢弃，')
+      console.log('           所以里面未必是真因 —— 要结合当时的操作判断。')
+      console.log('')
+      console.log('     如果是插件引起的：')
+      console.log('       · 先把可疑插件禁用，重启观察')
+      console.log('       · 反复崩 → 用 FK 的【快照】回滚到崩溃前（配置层可能被带坏）')
+      console.log('     如果是 DSH 自身的 bug：')
+      console.log('       · 降级到上一个版本（比如 rc.3 → rc.2）')
+      console.log('')
+    }
 
     if (proxyDead.length > 0) {
       console.log('  👉 代理环境变量指向失效代理 —— 这个问题【回滚/重启都救不了】')
@@ -1071,8 +1255,9 @@ function readBaseline(opts) {
 function cmdSnapshot(opts) {
   const { home, profile } = resolveCtx(opts)
   const type = opts.daily ? 'daily' : 'manual'
+  const dshVersion = detectDshVersion(opts['dsh-version'], home)
 
-  const report = runCheck({ home, profile, dshVersion: opts['dsh-version'] })
+  const report = runCheck({ home, profile, dshVersion })
   // ⭐ 自动探测创建来源：有 DSH_SESSION_ID → AI，否则 → 用户
   const org = C.detectOrigin(opts.origin)
 
@@ -1081,7 +1266,7 @@ function cmdSnapshot(opts) {
     origin: opts.origin ?? org.origin,     // 显式指定优先（钩子传 'auto'）
     name: opts.name,
     note: opts.note,
-    dshVersion: opts['dsh-version'],
+    dshVersion,
     health: { overall: report.overall, counts: report.counts, issues: report.issues.slice(0, 20) },
   })
   C.pruneSnapshots(C.snapshotDir(home, profile))
@@ -1146,6 +1331,7 @@ function cmdShow(opts) {
 function cmdRestore(opts) {
   const { home, profile, root } = resolveCtx(opts)
   const dryRun = Boolean(opts['dry-run'])
+  const dshVersion = detectDshVersion(opts['dsh-version'], home)
 
   let target = null
   let why = ''
@@ -1222,7 +1408,14 @@ function cmdRestore(opts) {
     why = '用户指定'
   }
 
-  const snapDir = join(root, target.dir)
+  let snapDir
+  try {
+    snapDir = target.dir.startsWith(`${C.FIXED_DIR}/`)
+      ? C.fixedSlotDir(root, target.dir.slice(C.FIXED_DIR.length + 1))
+      : C.snapshotPath(root, target)
+  } catch (e) {
+    die(C.EXIT.NO_SNAPSHOT, e.message)
+  }
   const meta = C.readJson(join(snapDir, 'meta.json'))
   if (!meta) die(C.EXIT.NO_SNAPSHOT, `快照目录缺少 meta.json：${snapDir}`)
 
@@ -1275,7 +1468,7 @@ function cmdRestore(opts) {
   const before = C.createSnapshot({
     home, profile, type: 'before-restore',
     origin: 'auto',                     // ⭐ 回滚流程自动存
-    dshVersion: opts['dsh-version'],
+    dshVersion,
     health: { overall: 'unknown', counts: {}, issues: [] },
     name: `回滚前 ${C.localDate()} ${new Date().toTimeString().slice(0, 5)}`,
   })
@@ -1294,7 +1487,7 @@ function cmdRestore(opts) {
   for (const f of r.failed) console.log(`    ✗ ${f}  ← 未还原成功`)
 
   // ── 复检 ──
-  const after = runCheck({ home, profile, dshVersion: opts['dsh-version'] })
+  const after = runCheck({ home, profile, dshVersion })
   console.log(`\n  还原后体检：${after.overall}`)
   if (after.counts.fatal > 0) {
     console.log(`    ❌ 仍有 fatal：`)
@@ -1328,15 +1521,19 @@ function cmdRestore(opts) {
   }
 
   console.log(`\n  ${'='.repeat(58)}`)
-  if (r.failed.length === 0) {
+  const estateFailed = r.estate?.ok === false
+  if (r.failed.length === 0 && !estateFailed) {
     console.log(`   还原完成！请重新启动 DSH。`)
     console.log(`   回滚前的状态已存为：${before.id}`)
-  } else {
+  } else if (r.failed.length > 0) {
     console.log(`   部分文件未还原成功（${r.failed.length}/${C.SNAPSHOT_FILES.length}）`)
+  } else {
+    console.log(`   配置文件已还原，但运行时状态还原失败`)
+    console.log(`   回滚前的状态已存为：${before.id}`)
   }
   console.log(`  ${'='.repeat(58)}\n`)
 
-  return r.failed.length === 0 ? C.EXIT.OK : C.EXIT.PARTIAL
+  return r.failed.length === 0 && !estateFailed ? C.EXIT.OK : C.EXIT.PARTIAL
 }
 
 /** 读快照里的 bundles（用于差异对比）。 */
@@ -1404,7 +1601,7 @@ function cmdSessions(opts) {
 function cmdStatus(opts) {
   const { home, profile, root } = resolveCtx(opts)
   const idx = C.readIndex(root)
-  const report = runCheck({ home, profile, dshVersion: opts['dsh-version'] })
+  const report = runCheck({ home, profile, dshVersion: detectDshVersion(opts['dsh-version'], home) })
 
   console.log(`\n  DSH 配置状态 — ${profile}`)
   console.log(`  ${'-'.repeat(60)}`)
@@ -1421,9 +1618,11 @@ function cmdStatus(opts) {
 /** prune —— 清理过期快照。 */
 function cmdPrune(opts) {
   const { root } = resolveCtx(opts)
-  const r = C.pruneSnapshots(root)
-  console.log(`\n  已清理 ${r.removed.length} 个过期快照`)
-  for (const x of r.removed) console.log(`    - ${x}`)
+  const dryRun = Boolean(opts['dry-run'])
+  const r = C.pruneSnapshots(root, { dryRun })
+  const list = dryRun ? r.expired : r.removed
+  console.log(`\n  ${dryRun ? '将清理' : '已清理'} ${list.length} 个过期快照${dryRun ? '（预演，未修改）' : ''}`)
+  for (const x of list) console.log(`    - ${x}`)
   console.log('')
   return C.EXIT.OK
 }
@@ -1431,7 +1630,7 @@ function cmdPrune(opts) {
 /** diagnose —— 诊断（DSH 能启动但界面点不动时用）。 */
 function cmdDiagnose(opts) {
   const { home, profile } = resolveCtx(opts)
-  const report = runCheck({ home, profile, dshVersion: opts['dsh-version'] })
+  const report = runCheck({ home, profile, dshVersion: detectDshVersion(opts['dsh-version'], home) })
 
   console.log(`\n  DSH 配置诊断 — ${profile}`)
   console.log(`  ${'='.repeat(60)}`)
@@ -1533,7 +1732,9 @@ function showHelp() {
   ── 检查类 ──
     check                       静态体检（已装好的配置）
       --json                      JSON 输出
+      --verbose                  显示正常状态与已确认项
       --home-layer                只检查 $DSH_HOME/cordis.patch.yml
+                             fatal 返回 4；error/warn 返回 0（信息可见但不阻断）
 
     diagnose                    诊断（含依赖图、home 层排查）
 
@@ -1575,20 +1776,21 @@ function showHelp() {
   ── 维护类 ──
   ── .bat 固化类 ──
   fix <id> [--pin]            把某个快照固化为 .bat 的数据源
-    --pin                        钉住：一直用这一份，启动时不替换
+    --pin [--slot <名称>]         钉住指定快照；无 ID 时钉住当前固化副本
     （不加 --pin）                下次启动时自动换成当天的 daily
-  fix --unpin                 取消钉住，恢复跟随当天 daily
-  fix --show                  查看当前固化状态（含是否钉住）
-  fix --clear                 取消固化（.bat 将无法工作）
+  fix --unpin [--slot <名称>]    取消钉住，恢复跟随当天 daily
+  fix --show                   查看当前固化状态（含是否钉住）
+  fix --clear [--slot <名称>]    取消固化（.bat 将无法工作）
+    --slot <名称>                固化槽位（默认 bat-default）
 
-    prune                       清理过期快照
+    prune [--dry-run]             按数量 + 天数清理快照（不清理 fixed/）
     oplog                       查看操作日志
       --tail <n>                  只看最后 N 条
 
   ── 通用选项 ──
     --profile <name>            指定 profile（默认自动探测）
     --home <path>               指定 DSH_HOME
-    --dsh-version <v>           当前 DSH 版本（用于 engines 检查）
+    --dsh-version <v>           当前 DSH 版本（默认读取实际安装包）
 
   退出码：
     0 成功   1 一般错误   2 参数错误   3 profile 不存在
@@ -1623,16 +1825,11 @@ const COMMANDS = {
 async function main() {
   const opts = parseArgs(process.argv.slice(2))
   if (opts.help || opts.h) { showHelp(); process.exit(C.EXIT.OK) }
-  if (opts.version || opts.v) { console.log('dsh-rollback v1.5.3'); process.exit(C.EXIT.OK) }
+  if (opts.version || opts.v) { console.log('dsh-rollback v1.6.0'); process.exit(C.EXIT.OK) }
 
   const cmd = opts._[0]
   const fn = COMMANDS[cmd]
-  if (!fn) {
-    if (!cmd) { showHelp(); process.exit(C.EXIT.ARGS) }
-    die(C.EXIT.ARGS, `未知命令：${cmd}\n  跑 \`--help\` 看可用命令`)
-  }
-
-  // ⚠️ 命令名本身要从位置参数里移出，否则 show/trace 会把命令名当成第一个参数。
+  // 命令名本身要从位置参数里移出，否则 show/trace 会把命令名当成第一个参数。
   opts._ = opts._.slice(1)
 
   const t0 = Date.now()

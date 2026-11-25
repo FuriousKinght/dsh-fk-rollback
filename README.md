@@ -178,7 +178,7 @@ node dsh-rollback.mjs <命令> [选项]
 | `restore --dry-run` | 只显示会改什么 |
 | `trace [文件]` | 改动溯源（`--days N`） |
 | `sessions` | 列出最近会话 |
-| `prune` | 清理过期快照 |
+| `prune [--dry-run]` | 按数量 + 天数清理快照；`--dry-run` 只列清单、不删除；`fixed/` 永不清理 |
 | `oplog` | 查看操作日志 |
 
 **退出码**：0 成功 · 4 无可用快照 · 5 权限/占用 · 7 需人工 · 8 部分成功
@@ -393,20 +393,20 @@ fix --show
 每个文件头部都有 `@version`，`.bat` 用 `REM Version:`，都必须等于 `package.json` 的 `version`：
 
 ```text
-entry.js                    @version 1.5.3
-lib/client.js               @version 1.5.3
-lib/check.mjs               @version 1.5.3
-lib/estate.mjs              @version 1.5.3
-lib/trace.mjs               @version 1.5.3
-lib/core.mjs                @version 1.5.3
-lib/restart.mjs             @version 1.5.3
-lib/elog.mjs                @version 1.5.3
-dsh-rollback.mjs            @version 1.5.3
-lib/relaunch-helper.cjs     @version 1.5.3
-install.mjs                 @version 1.5.3
-还原DSH配置.bat              REM Version: 1.5.2
-清除旧Cookies.bat            REM Version: 1.5.2
-package.json                "version": "1.5.2"
+entry.js                    @version 1.6.0
+lib/client.js               @version 1.6.0
+lib/check.mjs               @version 1.6.0
+lib/estate.mjs              @version 1.6.0
+lib/trace.mjs               @version 1.6.0
+lib/core.mjs                @version 1.6.0
+lib/restart.mjs             @version 1.6.0
+lib/elog.mjs                @version 1.6.0
+dsh-rollback.mjs            @version 1.6.0
+lib/relaunch-helper.cjs     @version 1.6.0
+install.mjs                 @version 1.6.0
+还原DSH配置.bat              REM Version: 1.6.0
+清除旧Cookies.bat            REM Version: 1.6.0
+package.json                "version": "1.6.0"
 ```
 
 ### 发版检查清单
@@ -415,7 +415,7 @@ package.json                "version": "1.5.2"
 
 ```text
 [ ] package.json 的 version 已改
-[ ] 上述 12 个文件的 @version / Version 行全部同步
+[ ] 上述 14 个文件的 @version / Version 行全部同步
 [ ] dsh-rollback.mjs --version 输出一致
 [ ] README 页脚「*版本 x.y.z · 日期*」一致
 [ ] README 更新记录有对应章节
@@ -433,6 +433,308 @@ UTF-8 中文和框线字符会被拆成乱码再当命令执行。版本行只�
 ---
 
 ## 更新记录
+
+### v1.6.0（2026-11-25）
+
+**正式版审计：修复数据安全、误报漏报、安装与重启竞态。**
+
+#### 快照与还原
+
+- 快照索引改为跨进程同步锁；Host 与 CLI 同时建快照不再丢条目。
+- 固化副本先写临时槽并校验，成功后才替换；失败保留旧副本。
+- 快照路径只允许四类池下的安全时间戳 ID 或 fixed 安全槽；拒绝索引穿越、符号链接和 junction。
+- 还原入口固定校验来源；旧版 fixed 只凭自身配置指纹兼容，不读快照池或索引。
+- 阶段 A 失败不碰旧配置；阶段 B 失败反向撤销，撤销失败保留 rescue。
+- 状态还原复制失败不再报成功，并尽量恢复旧状态；无法撤销时保留备份并明确失败。
+- last-good 排除 fatal/error/broken/unknown，兼容字符串与对象健康值。
+
+#### 体检准确性
+
+- Cookie BLOB 按真实字节统计，只计本机 `dsh-auth-*`，大小写敏感；删除数取 `stmt.changes`。
+- Cookie 状态并入完整 `check` 计数、结论和告警，不再出现「体检正常但 Cookie 已危险」。
+- 不可读时按明确估算分级，否则只提示，不把 Chromium 运行中锁库当致命。
+- `tasklist` 探测失败视为未知；Cookie、状态重置、核心包移动只在其明确未运行时执行。
+- 代理修复由服务端重新探活，跳过刚恢复的代理；只允许白名单键，值不拼进 PowerShell 源码。
+- `renderer` 崩溃始终只提示；main/host 在 7 天窗口内反复出现才升级为错误。
+- 确认问题校验签名，配置变化后重新提示；已确认项不再显示「一切正常」。
+- client source 按 `baseUrl + loaderName` 判重；bundle 插入后由 profile 同 id 覆盖的正常配置不误报。
+- `disabled: !!js` 单独识别；未写 `disabled` 的普通条目不再被当成动态表达式，surfcore 真冲突仍报 fatal。
+- 核心包副本检查与自动隔离清单统一，安装目录同一 realpath 不算第二实例。
+- patch 顶层非数组、非法 client export 和检查器读取失败不再伪装正常。
+
+#### 安装、诊断与重启
+
+- 安装预演不写盘；真实目录、链接、`.ignored` 和 package.json 均可备份/恢复。
+- 安装脚本透传退出码，支持 `DSH_PROFILE`/`--profile`，pnpm 从实际 runtime 探测。
+- 诊断报告统一脱敏 JWT、PAT、带引号 JSON 密码和本机绝对路径。
+- `.bat` 只使用 fixed 固化副本；无法确认结果时不再谎称「没有修改文件」。
+- 重启使用每请求 UUID 目录、模块级互斥和 `webServer.port`，不信任请求 Host。
+- 旧进程或端口未在 40 秒内释放时终止重启，不清 Cookie、不启动第二个实例。
+- Cookie 标记只在启动消费一次，GET 体检与 Cookie 端点保持只读。
+
+#### 验证
+
+- 核心：真实同根双进程各建 60 份，最终索引/磁盘均为 120，无丢失、无孤儿。
+- 还原：正常、阶段 A/B 失败、状态部分失败、旧 fixed 兼容、损坏指纹拒绝均通过临时 fixture。
+- Cookie：71 个真实尺寸本机认证 Cookie 计入 fatal；外站与大小写变体排除。
+- 安装：预演目录树不变，失败退出码不伪装成功。
+- 面板：查改动跳转、回滚进度清理、提示与真问题分离通过。
+- 首屏：先渲染面板骨架、tab、搜索和快照卡片，`/info` 在后台加载；不再整页阻塞于“正在读取”。
+- 首次打开性能：Host 不再尝试读取运行中被 Chromium 锁定的 Cookies，也不再首次启动 `tasklist`；`/info` 直接返回 Cookie 不可读状态，由 `/auth-cookies` 提供基线估算。
+- 重启探测：`/restart-helper` 改为纯后台请求，不参与面板首次显示；临时耗时日志已移除。
+- 实机验证：重启 DSH 后第一次进入「设置 → FK回滚设置」已达到毫秒级显示，不再出现首次慢、后续秒开。
+- 全量：11 个 JS 语法、模块加载、CLI 回归、版本一致性与敏感信息扫描。
+
+### v1.5.5（2026-11-25）
+
+**修复：设置里的「最长 N 天」之前只保存、从未执行。**
+
+#### 现象与根因
+
+用户设置「最多 20 个、最长 7 天」，列表仍有 36 个。核对后：
+
+- 20 个手动/自动留痕快照：数量限制正常；
+- 每日 3 个、滚动 3 个、回滚记录 10 个：独立配额，规则外；
+- `fixed/` 固化副本：额外一份，不计入列表，也不自动清理；
+- **`maxDays` 只写进 `index.json`，`pruneSnapshots()` 从未读取**，所以超过 7 天的手动快照和回滚记录仍被保留。
+
+#### 本次修复
+
+- `pruneSnapshots()` 同时执行**数量 + 天数**规则；
+- 每日、滚动、手动/自动留痕、回滚记录四类统一受 `maxDays` 约束；
+- 与当前配置一致的 `●` 快照、无法确认创建时间的条目不删；
+- `fixed/` 固化副本仍永不自动清理，保证 `.bat` 最后兜底；
+- 保存策略后立即应用新规则，并返回实际清理数量；清理失败不会谎报成功；
+- 新增 `prune --dry-run`，可先查看将删除的完整路径；
+- 列表头改为「手动类上限 N · 最长 N 天」，不再把总数 36 误显示成上限 20；
+- 设置页明确四类独立配额与 `fixed/` 例外。
+
+#### 临时环境自测
+
+通过：四类天数清理、独立数量配额、dry-run 不改磁盘/索引、`●` 保护、`fixed/` 保护、索引同步、重复执行幂等。
+
+### v1.5.4（2026-11-16）
+
+**新增：崩溃日志检测 —— 「上次崩过」会主动告诉你**
+
+#### 用户的原话
+
+> 「我电脑崩溃那次，FK回滚插件好像没有弹窗报错误信息给我」
+
+#### 为什么当时没弹（两层原因）
+
+**① 崩溃当下：物理上不可能**
+
+```text
+host 进程退出或 main 进程崩溃
+   ↓
+整个 DSH 应用退出
+   ↓
+FK 的 client.js 跑在 renderer 里，也一起没了
+   ↓
+❌ 没有任何代码在运行，不可能弹窗
+```
+
+**这不是 FK 的疏忽 —— 任何插件都做不到「崩溃瞬间报警」。**
+
+**② 崩溃之后重启：FK 根本没查崩溃日志**
+
+```text
+重启 DSH
+   ↓
+FK 跑体检（30 个检查项）
+   ↓
+全部围绕 profile 配置 + Electron 运行时状态
+   ↓
+没有一个读 %APPDATA%\@deepseek-ai\dsh-desktop\logs\crash-*.log
+   ↓
+配置文件确实没问题 → 报「✅ 一切正常」
+   ↓
+用户：我明明刚崩过，怎么一切正常？
+```
+
+**实测确认：`check.mjs` 里 `crash` / `崩溃` / `logs` 出现 0 次。**
+
+所以 v1.5.4 做的不是「崩溃时报警」，而是**「下次启动时告诉你上次崩过」**——这是唯一可行也最有用的时机。
+
+#### 新增检查项 `crash-recent`
+
+**读取路径：**
+
+```text
+<userData>/logs/crash-<ISO时间戳>-<source>.log
+例：C:\Users\<你>\AppData\Roaming\@deepseek-ai\dsh-desktop\logs\
+    crash-2026-11-16T01-36-42-783Z-host.log
+```
+
+**分级：按【次数】，不按【来源】**
+
+> ⚠️ 这里改过一次。原因见下方「用户的第二次反馈」。
+
+| 24 小时内崩溃次数 | 级别 | 弹窗 | 面板显示 |
+|---|---|---|---|
+| **1 ~ 2 次**（偶发） | `info` | ❌ **不弹** | 「✅ 一切正常（另有 1 条提示…）」 |
+| **≥ 3 次**（反复） | `error` | ✅ 弹 | 「⚠️ 1 个问题」 |
+
+**用户的第二次反馈（2026-11-17，原话）：**
+
+> 「把上一次崩溃搞成这样的警告⚠很吓人的！
+>   我感觉上一次崩溃不用提醒！因为都能重新启动了，
+>   那肯定知道发生了什么，这样搞反而是多此一举」
+
+**他说得对：**
+
+```text
+能重新启动
+   ↓
+= 用户刚刚亲身经历了崩溃 = 他当然知道
+   ↓
+这时候再弹个大警告
+   ↓
+唯一的后果是「又吓他一跳」
+```
+
+**所以 v1.5.4 第一版做错了：**
+
+```text
+按来源分级：
+  main   → fatal  → 弹窗
+  host   → error  → 弹窗
+  renderer → warn → 不弹
+   ↓
+结果：你 11-16 崩了一次 host，重启后 FK 弹了个 error 警告
+   ↓
+❌ 多此一举
+```
+
+**改成按次数之后：**
+
+```text
+偶发 1 次 → info → 不弹，只在面板括号里写「另有 1 条提示」
+反复 3 次 → error → 弹窗（说明 DSH 一直起不来，这才值得警告）
+```
+
+**这个设计自动覆盖最痛的场景：**
+
+```text
+main 崩溃导致应用起不来
+   ↓
+用户会反复启动尝试
+   ↓
+崩溃次数累积
+   ↓
+到 3 次 → 自动升级为 error → 弹窗
+   ↓
+✅ 不用特判「main 更严重」，靠次数自然识别
+```
+
+**面板显示效果（实测渲染）：**
+
+```text
+你的情况（0 真问题 + 1 提示）：
+  【体检】 ✅ 一切正常（另有 1 条提示 · 8 项正常状态，都不影响使用）
+
+全干净：
+  【体检】 ✅ 一切正常（另有 8 项正常状态，都不影响使用）
+
+反复崩溃 3 次：
+  【体检】 ⚠️ 1 个问题（另有 8 项正常状态，都不影响使用）  [查看] [回滚]
+```
+
+**关键修正：`realCount` 只算 `problems`，`notices` 单独计数。**
+
+```js
+// 改前（错）：提示也算问题 → 显示「⚠️ 1 个问题」
+const realCount = (c.problems || []).length + (c.notices || []).length
+
+// 改后（对）：只有真问题才算
+const realCount = (c.problems || []).length
+const noticeCount = (c.notices || []).length
+```
+
+**按时间分级（避免天天骚扰）：**
+
+| 距现在 | 处理 |
+|---|---|
+| **24 小时内** | 按上面的次数规则判级 |
+| 24 小时 ~ 7 天 | 只进面板，报 `crash-older`（info 级） |
+| 超过 7 天 | 完全不提（历史噪音） |
+
+**性能设计：**
+
+```text
+崩溃日志可能几十 KB（你的 11-03 那份 73 KB）
+   ↓
+只读每个文件的前 64 KB
+   ↓
+只解析头部 time/source/app 和 --- error --- 后第一行
+```
+
+#### 实测（用你真实的崩溃日志）
+
+```text
+【① 真实 userData】
+  扫描: {"scanned":1,"fresh":1,"kept":0}
+  [error] crash-recent
+    DSH 最近 24 小时内崩溃过 1 次：2026-11-16 09:36（host · v0.2.2-rc.3）
+    首行错误：Error: dsh desktop host exited with 1: ...
+
+【② 模拟 24h 内 main 崩溃】  ✅ fatal
+【③ 模拟 24h 内 host 崩溃】  ✅ error
+【④ 模拟 24h 内 renderer 崩溃】✅ warn（不弹）
+【⑤ 模拟 8 天前崩溃】        ✅ 完全不提
+【⑥ 无 logs 目录】           ✅ 静默
+```
+
+#### 同时修正：崩溃不归「可还原快照」
+
+**改之前的输出会误导：**
+
+```text
+👉 其余问题 —— 可尝试还原快照：
+     dsh-rollback list
+     dsh-rollback restore <快照id>
+```
+
+**但崩溃还原快照没用。改之后：**
+
+```text
+👉 DSH 崩过 —— 这个问题【还原快照也救不了】
+
+   原因：崩溃是程序运行时的错误（比如 Electron 主进程竞态、
+         某个插件抛异常），不是配置文件坏了。
+         快照只备份 5 个配置文件，还原不了一个已经发生的崩溃。
+
+   该怎么看：
+     日志：logs/crash-2026-11-16T01-36-42-783Z-host.log
+
+   注意：崩溃报告只记录【第一个】错误，后续错误会被丢弃，
+         所以里面未必是真因 —— 要结合当时的操作判断。
+
+   如果是插件引起的：
+     · 先把可疑插件禁用，重启观察
+     · 反复崩 → 用 FK 的【快照】回滚到崩溃前（配置层可能被带坏）
+   如果是 DSH 自身的 bug：
+     · 降级到上一个版本（比如 rc.3 → rc.2）
+```
+
+#### 一个必须知道的事实
+
+**崩溃报告**不等于**真因**。**
+
+```text
+DesktopFatalRecovery.report() 只处理第一个错误（reported 去重）
+   ↓
+后续错误 —— 包括 Host 子进程的 stderr 尾部 —— 全部丢弃
+   ↓
+所以同一台机器反复崩，日志可能逐字节相同
+```
+
+**这就是为什么 2026-11-15 那份别人写的事故报告里，9 份崩溃日志完全一样 —— 不是原因相同，是只记了第一个。**
+
+**FK 在 hint 里明确提示了这一点，避免用户把首选错误当成根因。**
+
+---
 
 ### v1.5.3（2026-11-14）
 

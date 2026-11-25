@@ -4,7 +4,7 @@ chcp 437 >nul 2>&1
 
 REM ============================================================
 REM  FK rollback - clean accumulated auth cookies
-REM  Version: 1.5.3
+REM  Version: 1.6.0
 REM
 REM  WHY THIS EXISTS (incident 2026-10-26):
 REM

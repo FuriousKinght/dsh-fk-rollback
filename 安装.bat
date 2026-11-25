@@ -4,7 +4,7 @@ chcp 437 >nul 2>&1
 
 REM ============================================================
 REM  FK rollback plugin - one-click installer
-REM  Version: 1.5.3
+REM  Version: 1.6.0
 REM
 REM  Why this exists: users run "node install.mjs" from whatever
 REM  directory their shell happens to be in (often C:\Windows\
@@ -93,12 +93,18 @@ echo   node: %NODE%
 echo.
 
 "%NODE%" "%INSTALLER%" %*
+set "RC=%ERRORLEVEL%"
 
 echo.
 echo ============================================================
-echo   Finished. Read the output above for any warning marked [X] or [ ].
-echo   Then fully quit DSH and start it again.
+if "%RC%"=="0" (
+  echo   Finished successfully.
+  echo   Fully quit DSH and start it again.
+) else (
+  echo   Installer failed - exit code %RC%.
+  echo   Read the output above before retrying.
+)
 echo ============================================================
 echo.
 pause
-exit /b 0
+exit /b %RC%

@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 REM ============================================================
 REM  DSH config restore (FK rollback)  --  dsh-fk-rollback
 REM
-REM  Version: 1.5.3   (must match package.json; modules 1-6 ship as one)
+REM  Version: 1.6.0   (must match package.json; modules 1-6 ship as one)
 REM
 REM  This is the LAST-RESORT path: DSH is broken, the panel
 REM  will not open. This script needs only node.exe.
@@ -61,7 +61,7 @@ if not defined DSH_HOME (
   echo   Set DSH_HOME to the folder that contains \profiles, then run:
   echo.
   echo     set DSH_HOME=C:\path\to\your\dsh-home
-  echo     "%NODEPATH%" "%ROLLBACK_JS%" restore --last-good
+  echo     "%NODEPATH%" "%ROLLBACK_JS%" restore
   echo.
   pause
   exit /b 9
@@ -170,7 +170,7 @@ echo   restoring ...
 echo ============================================================
 echo.
 
-"%NODEPATH%" "%ROLLBACK_JS%" restore --last-good --dsh-version 0.2.1-rc.2
+"%NODEPATH%" "%ROLLBACK_JS%" restore
 set "RC=%ERRORLEVEL%"
 
 echo.
@@ -220,7 +220,7 @@ if "%RC%"=="0" (
 ) else (
   echo   [X] restore failed - exit code %RC%
   echo.
-  echo   No files were modified.
+  echo   Result is uncertain. Check the output above before retrying.
   echo   Help: "%NODEPATH%" "%ROLLBACK_JS%" --help
 )
 echo ============================================================

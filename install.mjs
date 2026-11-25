@@ -26,12 +26,12 @@
  *   node install.mjs --home "C:\Users\Administrator\.dsh"
  *   node install.mjs --dry-run
  *
- * @version 1.5.3
+ * @version 1.6.0
  */
 
 import {
-  existsSync, readFileSync, writeFileSync, mkdirSync, rmSync,
-  lstatSync, cpSync, realpathSync,
+  existsSync, readFileSync, writeFileSync, mkdirSync, rmSync, copyFileSync,
+  lstatSync, cpSync, realpathSync, renameSync, readdirSync, statSync,
 } from 'node:fs'
 import { join, dirname, resolve, relative, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -68,9 +68,20 @@ try {
 
 const argv = process.argv.slice(2)
 const dryRun = argv.includes('--dry-run')
+const argNames = new Set(['--home', '--profile'])
 function argOf(name) {
   const i = argv.indexOf(name)
-  return i >= 0 && argv[i + 1] ? argv[i + 1] : undefined
+  if (i < 0) return undefined
+  const inline = argv[i].indexOf(name + '=')
+  if (inline === 0) return argv[i].slice(name.length + 1) || undefined
+  const value = argv[i + 1]
+  return value !== undefined && !value.startsWith('--') ? value : undefined
+}
+for (const name of argNames) {
+  if (argv.some((a) => a === name || a.startsWith(name + '=')) && !argOf(name)) {
+    bad(`${name} needs a value`)
+    process.exit(2)
+  }
 }
 
 // 不用 ANSI 颜色码：
@@ -86,10 +97,15 @@ const bad = (s) => console.log('  [FAIL] ' + s)
 // 找 DSH_HOME
 // ─────────────────────────────────────────────────────────────
 
+function hasProfiles(dir) {
+  try { return existsSync(dir) && existsSync(join(dir, 'profiles')) } catch { return false }
+}
+
 function findHome() {
   const explicit = argOf('--home')
   if (explicit) return resolve(explicit)
   if (process.env.DSH_HOME) return resolve(process.env.DSH_HOME)
+  if (process.env.DSH_PROFILE_DIR) return resolve(process.env.DSH_PROFILE_DIR, '..', '..')
 
   const cands = [
     join(homedir(), '.dsh'),
@@ -100,11 +116,32 @@ function findHome() {
     cands.push(join(drive, '\\', 'dsh-data'))
   }
   for (const c of cands) {
-    try {
-      if (existsSync(join(c, 'profiles'))) return resolve(c)
-    } catch { /* 下一个 */ }
+    if (hasProfiles(c)) return resolve(c)
   }
   return null
+}
+
+function findProfile(home) {
+  const explicit = argOf('--profile') ?? process.env.DSH_PROFILE
+  if (explicit) {
+    if (explicit === '.' || explicit === '..' || /[\\/]/.test(explicit)) {
+      bad(`profile must be a single directory name: ${explicit}`)
+      process.exit(2)
+    }
+    return explicit
+  }
+  const profilesDir = join(home, 'profiles')
+  if (!existsSync(profilesDir)) return 'desktop'
+  const markers = []
+  for (const name of readdirSync(profilesDir)) {
+    try {
+      if (statSync(join(profilesDir, name, 'cordis.yml')).isFile()) {
+        markers.push({ name, at: statSync(join(profilesDir, name, 'cordis.yml')).mtimeMs })
+      }
+    } catch { /* 没有 marker 的目录跳过 */ }
+  }
+  markers.sort((a, b) => b.at - a.at)
+  return markers[0]?.name ?? 'desktop'
 }
 
 out('')
@@ -123,13 +160,14 @@ if (!HOME) {
   process.exit(2)
 }
 
-const PROFILE = 'desktop'
+const PROFILE = findProfile(HOME)
 const PROFILE_DIR = join(HOME, 'profiles', PROFILE)
 const NM_DIR = join(PROFILE_DIR, 'node_modules')
 const TARGET = join(HOME, 'plugin-src', 'dsh-fk-rollback')
 const PKG_JSON = join(PROFILE_DIR, 'package.json')
 
 out(`  DSH_HOME : ${HOME}`)
+out(`  profile  : ${PROFILE}`)
 out(`  profile  : ${PROFILE_DIR}`)
 out(`  插件目标 : ${TARGET}`)
 if (dryRun) out(`  模式     : 预演（不写任何文件）`)
@@ -163,7 +201,7 @@ function dshRunning() {
 if (!existsSync(PKG_JSON)) {
   bad(`${PKG_JSON} 不存在`)
   out('')
-  out('  请先启动一次 DSH，让它生成 desktop profile，再运行本脚本。')
+  out(`  请先启动一次 DSH，让它生成 ${PROFILE} profile，再运行本脚本。`)
   out('')
   process.exit(3)
 }
@@ -177,9 +215,11 @@ if (!existsSync(PKG_JSON)) {
 //   在运行 → pnpm install 会失败，并留下「有依赖声明、无 node_modules 链接」
 //   的半成品状态，DSH 下次启动报 cannot resolve profile bundle。
 //   所以：运行中只做配置部分，并明确告知下一步怎么补依赖。
-const dshCount = dshRunning()
+const dshCount = dryRun ? 0 : dshRunning()
 let configOnly = false
-if (dshCount === null) {
+if (dryRun) {
+  ok('预演跳过进程检测，继续检查所有安装步骤')
+} else if (dshCount === null) {
   warn('无法检测 DSH 进程（非 Windows 或 tasklist 不可用）')
 } else if (dshCount > 0) {
   warn(`检测到 ${dshCount} 个 DSH 进程正在运行`)
@@ -208,6 +248,17 @@ out('')
 
 out('[1/4] 检查插件文件')
 
+function backupStamp() {
+  return new Date().toISOString().replace(/[-:T.]/g, '').slice(0, 15)
+}
+
+function uniqueBackupPath(path) {
+  let candidate = `${path}.bak-${backupStamp()}`
+  let n = 1
+  while (existsSync(candidate)) candidate = `${path}.bak-${backupStamp()}-${n++}`
+  return candidate
+}
+
 const SELF_IS_TARGET = (() => {
   try { return realpathSync(HERE).toLowerCase() === realpathSync(TARGET).toLowerCase() }
   catch { return false }
@@ -221,11 +272,18 @@ if (SELF_IS_TARGET) {
   if (!havePkg) {
     warn('但缺少 package.json —— 将用当前目录的内容覆盖')
     if (!dryRun) {
-      rmSync(TARGET, { recursive: true, force: true })
-      mkdirSync(TARGET, { recursive: true })
-      cpSync(HERE, TARGET, { recursive: true })
+      const backup = uniqueBackupPath(TARGET)
+      renameSync(TARGET, backup)
+      try {
+        cpSync(HERE, TARGET, { recursive: true })
+      } catch (e) {
+        try { rmSync(TARGET, { recursive: true, force: true }) } catch { /* 保留现场供恢复 */ }
+        renameSync(backup, TARGET)
+        throw e
+      }
+      ok(`旧目录已备份到：${backup}`)
     }
-    ok('已复制')
+    ok(dryRun ? `将备份并替换：${TARGET}` : '已备份旧目录并替换')
   }
 } else {
   if (dryRun) {
@@ -237,9 +295,12 @@ if (SELF_IS_TARGET) {
   }
 }
 
-// 关键校验：目标里必须有入口文件
+// 关键校验：目标里必须有入口文件。预演时若目标尚不存在，则检查当前包。
+const targetNeedsReplace = !SELF_IS_TARGET && existsSync(TARGET)
+  && !existsSync(join(TARGET, 'package.json'))
+const checkBase = !SELF_IS_TARGET && (!existsSync(TARGET) || targetNeedsReplace) ? HERE : TARGET
 for (const need of ['package.json', 'entry.js', 'lib/client.js', 'dsh-rollback.mjs']) {
-  if (existsSync(join(TARGET, need))) continue
+  if (existsSync(join(checkBase, need))) continue
   bad(`缺少 ${need} —— 压缩包可能解压不完整`)
   process.exit(4)
 }
@@ -269,52 +330,39 @@ const kind = classifyLink(strayDir)
 if (kind === 'missing') {
   ok('node_modules 里没有 dsh-fk-rollback —— 不会冲突')
 } else if (kind === 'symlink') {
-  // junction 指向别处，删掉它不影响源
-  warn(`node_modules/dsh-fk-rollback 是个链接（${kind}），移除以便 pnpm 重建`)
-  if (!dryRun) {
-    try {
-      rmSync(strayDir, { force: true })
-      ok('已移除旧链接')
-    } catch (e) {
-      bad('移除失败（DSH 可能还在运行）：' + String(e?.message ?? e))
-    }
-  }
+  // junction 指向别处，rename 链接本身不影响源。
+  warn(`node_modules/dsh-fk-rollback 是链接，将 rename 到 ${uniqueBackupPath(strayDir)}`)
 } else if (kind === 'dir') {
-  bad('node_modules/dsh-fk-rollback 是一个【真实目录】')
+  warn('node_modules/dsh-fk-rollback 是一个【真实目录】')
   out('      说明插件曾被手动复制到 node_modules，pnpm 因此判定它为「孤儿」')
   out('      并挪到 .ignored，随后重建链接时路径冲突 → 就是你看到的报错')
-  if (!dryRun) {
-    try {
-      rmSync(strayDir, { recursive: true, force: true })
-      ok('已删除该目录')
-    } catch (e) {
-      bad('删除失败：' + String(e?.message ?? e))
-      out('')
-      out('  按顺序试这几种办法：')
-      out('')
-      out('  1) 完全退出 DSH（关窗口 + 确认托盘图标消失），再跑一次本脚本')
-      out('')
-      out('  2) 如果你现在就在这个目录里（提示符形如')
-      out('       ...\\node_modules\\dsh-fk-rollback> ），')
-      out('     先切到别处再运行：')
-      out('       cd %USERPROFILE%')
-      out('       node "<本脚本完整路径>"')
-      out('')
-      out('  3) 手动删掉它（会在资源管理器里删不掉时，用管理员 PowerShell）：')
-      out(`       Remove-Item -Recurse -Force "${strayDir}"`)
-      out('')
-      out('  删不掉通常是因为有程序占着它——DSH 没退干净，或终端正开在里面。')
-      out('')
-      process.exit(5)
-    }
+  out(`      将先 rename 到 ${uniqueBackupPath(strayDir)}，不删除副本`)
+} else if (kind === 'file') {
+  warn(`node_modules/dsh-fk-rollback 是文件，将先 rename 到 ${uniqueBackupPath(strayDir)}`)
+}
+
+if (!dryRun && kind !== 'missing') {
+  try {
+    const backup = uniqueBackupPath(strayDir)
+    renameSync(strayDir, backup)
+    ok(`已移到备份：${backup}`)
+  } catch (e) {
+    bad('移动失败（DSH 可能还在运行）：' + String(e?.message ?? e))
+    process.exit(5)
   }
 }
 
 if (existsSync(ignoredDir)) {
-  warn('清理 node_modules/.ignored 残留')
+  warn(`将 node_modules/.ignored 残留 rename 到 ${uniqueBackupPath(ignoredDir)}`)
   if (!dryRun) {
-    try { rmSync(ignoredDir, { recursive: true, force: true }); ok('已清理') }
-    catch { warn('清理失败（可忽略）') }
+    try {
+      const backup = uniqueBackupPath(ignoredDir)
+      renameSync(ignoredDir, backup)
+      ok(`已移到备份：${backup}`)
+    } catch (e) {
+      warn('移动失败：' + String(e?.message ?? e))
+      process.exit(5)
+    }
   }
 } else {
   ok('没有 .ignored 残留')
@@ -325,7 +373,7 @@ if (existsSync(ignoredDir)) {
 // ─────────────────────────────────────────────────────────────
 
 out('')
-out('[3/4] 注册依赖到 profiles/desktop/package.json')
+out(`[3/4] 注册依赖到 profiles/${PROFILE}/package.json`)
 
 const pkg = JSON.parse(readFileSync(PKG_JSON, 'utf8'))
 pkg.dependencies ??= {}
@@ -357,8 +405,20 @@ if (before === linkSpec) {
 ok(`bundles 已包含 dsh-fk-rollback`)
 
 if (!dryRun) {
-  writeFileSync(PKG_JSON, JSON.stringify(pkg, null, 2) + '\n', 'utf8')
-  ok('package.json 已写回')
+  const backup = uniqueBackupPath(PKG_JSON)
+  copyFileSync(PKG_JSON, backup)
+  const tmp = `${PKG_JSON}.install-tmp`
+  try {
+    writeFileSync(tmp, JSON.stringify(pkg, null, 2) + '\n', 'utf8')
+    renameSync(tmp, PKG_JSON)
+    ok(`package.json 已写回；备份：${backup}`)
+  } catch (e) {
+    try { rmSync(tmp, { force: true }) } catch { /* 忽略 */ }
+    try { copyFileSync(backup, PKG_JSON) } catch (restoreError) {
+      bad(`package.json 恢复失败：${String(restoreError?.message ?? restoreError)}；备份仍在 ${backup}`)
+    }
+    throw e
+  }
 } else {
   warn('（预演）未写入 package.json')
 }
@@ -370,7 +430,7 @@ if (!dryRun) {
 out('')
 out('[4/4] 结果')
 out('')
-out('  packages.json 里的最终形态：')
+out('  package.json 里的最终形态：')
 out(`    dependencies["dsh-fk-rollback"] = ${JSON.stringify(linkSpec)}`)
 out(`    dsh.profile.bundles 含 dsh-fk-rollback = true`)
 out('')
@@ -379,15 +439,65 @@ out('  下一步（必须按顺序）：')
 out('')
 out('  1. 完全退出 DSH（关窗口 + 确认托盘图标消失）')
 out('')
+const RUNTIME_ROOT = join(HOME, 'dsh-runtimes')
+
+function firstExisting(paths) {
+  return paths.find((p) => {
+    try { return existsSync(p) && statSync(p).isFile() } catch { return false }
+  }) ?? null
+}
+
+function findBundledNode() {
+  let runtimes = []
+  try { runtimes = readdirSync(RUNTIME_ROOT) } catch { /* 下面尝试安装目录 */ }
+  const candidates = []
+  for (const name of runtimes) {
+    candidates.push(join(RUNTIME_ROOT, name, 'dependencies', 'node', 'bin', 'node.exe'))
+    candidates.push(join(RUNTIME_ROOT, name, 'dependencies', 'node', 'node.exe'))
+  }
+  if (process.platform === 'win32') {
+    for (const base of [
+      ...(process.env.LOCALAPPDATA ? [join(process.env.LOCALAPPDATA, 'Programs', 'DeepSeek Harness')] : []),
+      join(process.env.PROGRAMFILES || 'C:\\Program Files', 'DeepSeek Harness'),
+      ...(process.env['PROGRAMFILES(X86)'] ? [join(process.env['PROGRAMFILES(X86)'], 'DeepSeek Harness')] : []),
+    ]) {
+      candidates.push(join(base, 'resources', 'runtime', 'primary-runtime', 'dependencies', 'node', 'bin', 'node.exe'))
+    }
+  }
+  candidates.push(process.execPath)
+  return firstExisting(candidates)
+}
+
+function findPnpm(nodePath) {
+  let runtimes = []
+  try { runtimes = readdirSync(RUNTIME_ROOT) } catch { /* 没有 runtime mirror */ }
+  const candidates = []
+  for (const name of runtimes) {
+    const dep = join(RUNTIME_ROOT, name, 'dependencies')
+    candidates.push(join(dep, 'pnpm', 'bin', 'pnpm.mjs'))
+    candidates.push(join(dep, 'pnpm', 'dist', 'pnpm.mjs'))
+  }
+  if (nodePath) {
+    candidates.push(join(dirname(nodePath), 'node_modules', 'pnpm', 'bin', 'pnpm.mjs'))
+    candidates.push(join(dirname(nodePath), '..', '..', 'pnpm', 'bin', 'pnpm.mjs'))
+  }
+  return firstExisting(candidates)
+}
+
+const bundledNode = findBundledNode()
+const bundledPnpm = findPnpm(bundledNode)
 if (configOnly) {
   out('  2. 直接重启 DSH —— 它启动时会自动 pnpm install')
   out('     （因为 DSH 运行时无法装依赖，所以刚才只改了配置）')
 } else {
   out('  2. 刷新依赖，二选一：')
   out('     A. 重新打开 DSH，它会自动 pnpm install')
-  out('     B. 手动跑：')
-out(`        cd "${PROFILE_DIR}"`)
-  out('        node install.mjs --pnpm')
+  if (bundledNode && bundledPnpm) {
+    out('     B. 用本包安装器执行已探测到的 pnpm：')
+    out(`        "${bundledNode}" "${join(HERE, 'install.mjs')}" --pnpm --home "${HOME}" --profile "${PROFILE}"`)
+  } else {
+    out('     B. 在 DSH 界面里刷新依赖（未找到可验证的 pnpm，不打印猜测命令）')
+  }
 }
 out('')
 out('  3. 启动 DSH，进 设置 → 侧边栏「FK回滚设置」')
@@ -396,17 +506,19 @@ out('─'.repeat(62))
 out('')
 
 if (argv.includes('--pnpm')) {
-  out('  正在执行 pnpm install …')
-  const { spawnSync } = await import('node:child_process')
-  const pnpmCands = [
-    join(HOME, 'dsh-runtimes', 'dsh-primary-runtime', 'dependencies', 'pnpm', 'dist', 'pnpm.mjs'),
-  ]
-  const pnpm = pnpmCands.find((p) => existsSync(p))
-  if (!pnpm) {
-    bad('找不到 pnpm.mjs，请手动在 DSH 界面里刷新依赖')
+  if (dryRun || configOnly) {
+    warn('（预演/config-only）未执行 pnpm install')
+    process.exit(0)
+  }
+  const nodePath = findBundledNode()
+  const pnpm = findPnpm(nodePath)
+  if (!nodePath || !pnpm) {
+    bad('找不到 DSH 实际 runtime 中的 node/pnpm，请手动在 DSH 界面里刷新依赖')
     process.exit(7)
   }
-  const r = spawnSync(process.execPath, [pnpm, 'install', '--reporter=append-only'], {
+  out(`  正在执行 pnpm install：${pnpm}`)
+  const { spawnSync } = await import('node:child_process')
+  const r = spawnSync(nodePath, [pnpm, 'install', '--reporter=append-only'], {
     cwd: PROFILE_DIR, stdio: 'inherit', windowsHide: true,
   })
   out('')
